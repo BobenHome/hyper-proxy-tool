@@ -19,10 +19,15 @@ use tower::{BoxError, ServiceBuilder, ServiceExt};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, instrument};
 
-// === HTTPS 新增引用 ===
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio_rustls::TlsAcceptor;
+
+use std::collections::HashMap;
+use std::fs; // 新增：用于读取文件
+use tokio_rustls::TlsAcceptor; // 新增：用于存储上游 Map
+
+use clap::Parser;
+use serde::Deserialize;
 
 // 定义通用错误
 type ProxyError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -36,43 +41,56 @@ async fn main() -> Result<(), ProxyError> {
         .with_env_filter("hyper_proxy_tool=info")
         .init();
 
-    // 1. 加载服务端证书和私钥
-    let certs = load_certs("cert.pem")?;
-    let key = load_private_key("key.pem")?;
+    // 1. 解析命令行参数
+    let args = Cli::parse();
+    info!("Loading config from: {}", args.config);
 
-    // 2. 配置服务端 TLS
+    // 2. 加载并解析配置文件
+    let config_content = fs::read_to_string(&args.config)
+        .map_err(|e| error(format!("Failed to read config file: {}", e)))?;
+
+    let config: AppConfig = toml::from_str(&config_content)
+        .map_err(|e| error(format!("Failed to parse config TOML: {}", e)))?;
+
+    info!("Config loaded: {:?}", config);
+
+    // 3. 使用配置中的证书路径 (不再硬编码 "cert.pem")
+    let certs = load_certs(&config.server.cert_file)?;
+    let key = load_private_key(&config.server.key_file)?;
+
+    // ... TLS Server Config 配置保持不变 ...
     let mut server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| error(format!("{}", e)))?;
-
-    // 设置 ALPN (应用层协议协商)，让浏览器知道我们支持 HTTP/1.1 和 HTTP/2
     server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-
     let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
 
-    // 3. 配置客户端 HTTPS 支持
-    // 这里我们构建一个既能连 http 也能连 https 的 connector
+    // ... Client 配置保持不变 ...
     let https_connector = HttpsConnectorBuilder::new()
-        .with_native_roots()? // 使用系统的根证书库
-        .https_or_http() // 自动适配 http:// 和 https://
-        .enable_http1()
-        .enable_http2()
+        .with_native_roots()?
+        .https_or_http()
+        .enable_all_versions()
         .build();
-
     let client = Client::builder(TokioExecutor::new())
         .pool_idle_timeout(Duration::from_secs(30))
-        .build(https_connector); // 传入 https connector
-
+        .build(https_connector);
     let client = Arc::new(client);
 
-    // 监听 8443 (HTTPS 常用端口)
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8443));
+    // 4. 将配置包装为 Arc，以便在 Handler 中使用
+    let config = Arc::new(config);
+
+    // 5. 使用配置中的监听地址
+    let addr: SocketAddr = config
+        .server
+        .listen_addr
+        .parse()
+        .map_err(|e| error(format!("Invalid listen address: {}", e)))?;
+
     let listener = TcpListener::bind(addr).await?;
     info!("HTTPS Proxy Server listening on https://{}", addr);
 
     loop {
-        // 等待 TCP 连接
         let (tcp_stream, remote_addr) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
@@ -83,10 +101,10 @@ async fn main() -> Result<(), ProxyError> {
 
         let client = client.clone();
         let tls_acceptor = tls_acceptor.clone();
+        // 传入 config
+        let config = config.clone();
 
-        // 关键点：TLS 握手可能耗时，必须在 spawn 内部进行
         tokio::spawn(async move {
-            // 4. 执行服务端 TLS 握手
             let tls_stream = match tls_acceptor.accept(tcp_stream).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -94,22 +112,21 @@ async fn main() -> Result<(), ProxyError> {
                     return;
                 }
             };
-
-            // 包装为 Hyper 可用的 IO
             let io = TokioIo::new(tls_stream);
 
             let proxy_service = service_fn(move |req| {
-                let upstream_url = "https://httpbin.org".parse::<Uri>().unwrap();
-                proxy_handler(req, client.clone(), Arc::new(upstream_url), remote_addr)
+                // 暂时还没实现动态路由，我们先传进去
+                proxy_handler(req, client.clone(), config.clone(), remote_addr)
             });
 
-            // Tower 中间件栈 (保持不变)
+            // ... Tower 中间件栈保持不变 ...
             let inner_service = ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
                 .timeout(Duration::from_secs(10))
                 .concurrency_limit(100)
                 .service(proxy_service);
 
+            // ... Error Wrapper 保持不变 ...
             let tower_service = service_fn(move |req| {
                 let inner = inner_service.clone();
                 async move {
@@ -132,21 +149,34 @@ async fn main() -> Result<(), ProxyError> {
 }
 
 // 代理逻辑
-#[instrument(skip(client, req), fields(method = %req.method(), uri = %req.uri()))]
+#[instrument(skip(client, config, req), fields(method = %req.method(), uri = %req.uri()))]
 async fn proxy_handler(
     mut req: Request<Incoming>,
     client: Arc<HttpClient>,
-    upstream_base: Arc<Uri>,
+    config: Arc<AppConfig>,
     remote_addr: SocketAddr,
 ) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError> {
     if req.uri().path() == "/health" {
-        let body = Full::new(Bytes::from("OK (HTTPS Enabled)"))
+        let body = Full::new(Bytes::from("OK (Config Loaded)"))
             .map_err(|e| match e {})
             .boxed();
         return Ok(Response::new(body));
     }
 
-    // 拼接目标 URL (支持 HTTPS)
+    let upstream_url_str = if let Some(upstream) = config.upstreams.get("httpbin") {
+        // 取第一个 URL
+        upstream
+            .urls
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("https://httpbin.org")
+    } else {
+        "https://httpbin.org"
+    };
+
+    let upstream_base = upstream_url_str.parse::<Uri>()?;
+
+    // --- 下面的逻辑保持不变 ---
     let path = req.uri().path();
     let path_query = req
         .uri()
@@ -154,7 +184,6 @@ async fn proxy_handler(
         .map(|pq| pq.as_str())
         .unwrap_or(path);
 
-    // 注意：upstream_base 现在是 https://httpbin.org
     let base_str = upstream_base.to_string();
     let base_trimmed = base_str.trim_end_matches('/');
     let uri_string = format!("{}{}", base_trimmed, path_query);
@@ -162,11 +191,9 @@ async fn proxy_handler(
 
     *req.uri_mut() = new_uri;
 
-    // 修改 Host 头 (TLS SNI 需要正确的 Host)
     if let Some(host) = upstream_base.host() {
         req.headers_mut().insert("host", host.parse()?);
     }
-
     req.headers_mut()
         .insert("x-forwarded-for", remote_addr.ip().to_string().parse()?);
 
@@ -174,7 +201,6 @@ async fn proxy_handler(
 
     let req_body = req.map(|b| b.map_err(|e| Box::new(e) as ProxyError).boxed());
 
-    // 发送请求 (client 内部会自动处理 TLS 握手)
     match client.request(req_body).await {
         Ok(res) => {
             info!("Upstream response: {}", res.status());
@@ -236,4 +262,40 @@ fn map_tower_error_to_response(err: BoxError) -> Response<BoxBody<Bytes, ProxyEr
     let mut resp = Response::new(body);
     *resp.status_mut() = StatusCode::BAD_GATEWAY;
     resp
+}
+
+// === 配置结构体定义 ===
+
+#[derive(Debug, Deserialize, Clone)]
+struct AppConfig {
+    server: ServerConfig,
+    upstreams: HashMap<String, UpstreamConfig>,
+    routes: Vec<RouteConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct ServerConfig {
+    listen_addr: String,
+    cert_file: String,
+    key_file: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct UpstreamConfig {
+    urls: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct RouteConfig {
+    path: String,
+    upstream: String,
+}
+
+// === 命令行参数定义 ===
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    /// 配置文件路径
+    #[arg(short, long, default_value = "config.toml")]
+    config: String,
 }

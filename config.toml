@@ -1,0 +1,25 @@
+# config.toml
+
+[server]
+listen_addr = "0.0.0.0:8443"
+cert_file = "cert.pem"
+key_file = "key.pem"
+
+# 定义上游服务池 (Map结构: name -> details)
+[upstreams]
+
+  [upstreams.httpbin]
+  # 目前我们只支持单 URL，为负载均衡做准备用 Array
+  urls = ["https://httpbin.org"]
+
+  [upstreams.local]
+  urls = ["http://127.0.0.1:9090"]
+
+# 定义路由规则 (List结构)
+[[routes]]
+path = "/api"
+upstream = "httpbin"
+
+[[routes]]
+path = "/web"
+upstream = "local"

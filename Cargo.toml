@@ -25,3 +25,11 @@ tokio-rustls = "0.26"
 rustls-pemfile = "2"
 # 5. 跨平台的类型定义 (Rustls 0.23+ 标准)
 rustls-pki-types = "1"
+
+
+# 1. 序列化/反序列化框架
+serde = { version = "1.0", features = ["derive"] }
+# 2. TOML 格式支持
+toml = "0.9.10"
+# 3. 命令行参数解析
+clap = { version = "4.5", features = ["derive"] }
