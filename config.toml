@@ -7,31 +7,17 @@ key_file = "key.pem"
 
 # 定义上游服务池 (Map结构: name -> details)
 [upstreams]
-# 上游 A: httpbin
-[upstreams.httpbin]
-urls = ["https://httpbin.org"]
+[upstreams.httpbin_cluster]
+urls = [
+  "https://httpbin.org",
+  "https://postman-echo.com"
+]
 
-# 上游 B: 本地测试服务 (为了演示，你可以指向任何真实存在的服务，或者还是 httpbin)
-# 这里演示指向 google (需要科学上网环境) 或者仍然指向 httpbin 但用来测试不同的路径
-[upstreams.echo]
-urls = ["https://postman-echo.com"]
+[upstreams.local]
+urls = ["http://127.0.0.1:9090"]
 
-# === 路由规则 (顺序很重要，从上到下匹配) ===
-
-# 规则 1: 访问 /api/v1/xxx -> 转发给 httpbin/xxx (去掉前缀)
+# === 路由规则===
 [[routes]]
 path = "/api/v1"
-upstream = "httpbin"
-strip_prefix = true
-
-# 规则 2: 访问 /get/xxx -> 转发给 postman-echo/get/xxx (保留前缀)
-[[routes]]
-path = "/get"
-upstream = "echo"
-strip_prefix = false
-
-# 规则 3: 默认路由 / -> httpbin (兜底)
-[[routes]]
-path = "/"
-upstream = "httpbin"
+upstream = "httpbin_cluster"
 strip_prefix = true

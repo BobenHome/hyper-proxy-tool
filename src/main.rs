@@ -23,11 +23,13 @@ use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use std::collections::HashMap;
-use std::fs; // 新增：用于读取文件
-use tokio_rustls::TlsAcceptor; // 新增：用于存储上游 Map
+use std::fs;
+use tokio_rustls::TlsAcceptor;
 
 use clap::Parser;
 use serde::Deserialize;
+
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // 定义通用错误
 type ProxyError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -41,11 +43,9 @@ async fn main() -> Result<(), ProxyError> {
         .with_env_filter("hyper_proxy_tool=info")
         .init();
 
-    // 1. 解析命令行参数
     let args = Cli::parse();
     info!("Loading config from: {}", args.config);
 
-    // 2. 加载并解析配置文件
     let config_content = fs::read_to_string(&args.config)
         .map_err(|e| error(format!("Failed to read config file: {}", e)))?;
 
@@ -54,7 +54,6 @@ async fn main() -> Result<(), ProxyError> {
 
     info!("Config loaded: {:?}", config);
 
-    // 3. 使用配置中的证书路径 (不再硬编码 "cert.pem")
     let certs = load_certs(&config.server.cert_file)?;
     let key = load_private_key(&config.server.key_file)?;
 
@@ -75,7 +74,7 @@ async fn main() -> Result<(), ProxyError> {
         .build(https_connector);
     let client = Arc::new(client);
 
-    // 4. 将配置包装为 Arc，以便在 Handler 中使用
+    // 4. 将配置包装为 Arc
     let config = Arc::new(config);
 
     // 5. 使用配置中的监听地址
@@ -197,18 +196,31 @@ async fn proxy_handler(
         }
     };
 
-    // 5. 负载均衡
-    // TODO: 这里可以引入 AtomicUsize 实现 Round-Robin 轮询
-    let upstream_url_str = match upstream_config.urls.first() {
-        Some(s) => s,
-        None => {
-            error!("Upstream '{}' has no URLs", route.upstream);
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Empty::new().map_err(|e| match e {}).boxed())
-                .unwrap());
-        }
-    };
+    // 5. Round-Robin 负载均衡
+    if upstream_config.urls.is_empty() {
+        error!("Upstream '{}' has no URLs", route.upstream);
+        return Ok(Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Empty::new().map_err(|e| match e {}).boxed())
+            .unwrap());
+    }
+
+    // 1. fetch_add(1) 原子地将计数器 +1，并返回旧值。
+    //    Ordering::Relaxed 性能最好，对于负载均衡来说不需要严格的内存顺序，只要唯一即可。
+    // 2. 取模运算 (%) 确保索引永远在 [0, len-1] 范围内。
+    let current_count = upstream_config.counter.fetch_add(1, Ordering::Relaxed);
+    let index = current_count % upstream_config.urls.len();
+
+    let upstream_url_str = &upstream_config.urls[index];
+
+    info!(
+        "Load Balancing: Route '{}' -> Upstream '{}' ({}/{}) -> {}",
+        route.path,
+        route.upstream,
+        index + 1,
+        upstream_config.urls.len(),
+        upstream_url_str
+    );
 
     let upstream_base = upstream_url_str.parse::<Uri>()?;
 
@@ -224,10 +236,8 @@ async fn proxy_handler(
     let final_path = if route.strip_prefix {
         // 如果开启了 strip_prefix，把路由前缀去掉
         // 比如：req: /api/v1/get, route: /api/v1 -> new: /get
-        info!("&route.path: {}", &route.path);
         if let Some(stripped) = path_query.strip_prefix(&route.path) {
             // 确保以 / 开头
-            info!("stripped {}", stripped);
             if !stripped.starts_with('/') {
                 format!("/{}", stripped)
             } else {
@@ -330,30 +340,34 @@ fn map_tower_error_to_response(err: BoxError) -> Response<BoxBody<Bytes, ProxyEr
 
 // === 配置结构体定义 ===
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize)]
 struct AppConfig {
     server: ServerConfig,
     upstreams: HashMap<String, UpstreamConfig>,
     routes: Vec<RouteConfig>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize)]
 struct ServerConfig {
     listen_addr: String,
     cert_file: String,
     key_file: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize)]
 struct UpstreamConfig {
     urls: Vec<String>,
+    // 原子计数器
+    // skip: 配置文件里不写这个字段，反序列化时忽略这个字段的映射
+    // default: 默认为 0
+    #[serde(skip, default)]
+    counter: AtomicUsize,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize)]
 struct RouteConfig {
     path: String,
     upstream: String,
-    // 默认为 false，如果配置文件未定义，就是 false
     #[serde(default)]
     strip_prefix: bool,
 }
