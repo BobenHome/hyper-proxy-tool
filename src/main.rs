@@ -58,7 +58,6 @@ async fn main() -> Result<(), ProxyError> {
     let certs = load_certs(&config.server.cert_file)?;
     let key = load_private_key(&config.server.key_file)?;
 
-    // ... TLS Server Config 配置保持不变 ...
     let mut server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
@@ -66,7 +65,6 @@ async fn main() -> Result<(), ProxyError> {
     server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
 
-    // ... Client 配置保持不变 ...
     let https_connector = HttpsConnectorBuilder::new()
         .with_native_roots()?
         .https_or_http()
@@ -115,18 +113,15 @@ async fn main() -> Result<(), ProxyError> {
             let io = TokioIo::new(tls_stream);
 
             let proxy_service = service_fn(move |req| {
-                // 暂时还没实现动态路由，我们先传进去
                 proxy_handler(req, client.clone(), config.clone(), remote_addr)
             });
 
-            // ... Tower 中间件栈保持不变 ...
             let inner_service = ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
                 .timeout(Duration::from_secs(10))
                 .concurrency_limit(100)
                 .service(proxy_service);
 
-            // ... Error Wrapper 保持不变 ...
             let tower_service = service_fn(move |req| {
                 let inner = inner_service.clone();
                 async move {
@@ -148,7 +143,6 @@ async fn main() -> Result<(), ProxyError> {
     }
 }
 
-// 代理逻辑
 #[instrument(skip(client, config, req), fields(method = %req.method(), uri = %req.uri()))]
 async fn proxy_handler(
     mut req: Request<Incoming>,
@@ -156,54 +150,124 @@ async fn proxy_handler(
     config: Arc<AppConfig>,
     remote_addr: SocketAddr,
 ) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError> {
+    // 1. 健康检查
     if req.uri().path() == "/health" {
-        let body = Full::new(Bytes::from("OK (Config Loaded)"))
+        let body = Full::new(Bytes::from("OK (Dynamic Routing)"))
             .map_err(|e| match e {})
             .boxed();
         return Ok(Response::new(body));
     }
 
-    let upstream_url_str = if let Some(upstream) = config.upstreams.get("httpbin") {
-        // 取第一个 URL
-        upstream
-            .urls
-            .first()
-            .map(|s| s.as_str())
-            .unwrap_or("https://httpbin.org")
-    } else {
-        "https://httpbin.org"
+    let req_path = req.uri().path();
+
+    // 2. 路由匹配逻辑 (First Match Wins)
+    let mut matched_route: Option<&RouteConfig> = None;
+    for route in &config.routes {
+        if req_path.starts_with(&route.path) {
+            matched_route = Some(route);
+            break; // 找到第一个匹配的就停止
+        }
+    }
+
+    // 3. 处理 404 (如果没有匹配到任何路由)
+    let route = match matched_route {
+        Some(r) => r,
+        None => {
+            info!("No route matched for path: {}", req_path);
+            let body = Full::new(Bytes::from("404 Not Found (Hyper Proxy)"))
+                .map_err(|e| match e {})
+                .boxed();
+            let mut resp = Response::new(body);
+            *resp.status_mut() = StatusCode::NOT_FOUND;
+            return Ok(resp);
+        }
+    };
+
+    // 4. 查找上游配置
+    let upstream_config = match config.upstreams.get(&route.upstream) {
+        Some(u) => u,
+        None => {
+            error!("Upstream '{}' not found in config", route.upstream);
+            let body = Full::new(Bytes::from("500 Config Error: Upstream Not Found"))
+                .map_err(|e| match e {})
+                .boxed();
+            let mut resp = Response::new(body);
+            *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            return Ok(resp);
+        }
+    };
+
+    // 5. 负载均衡
+    // TODO: 这里可以引入 AtomicUsize 实现 Round-Robin 轮询
+    let upstream_url_str = match upstream_config.urls.first() {
+        Some(s) => s,
+        None => {
+            error!("Upstream '{}' has no URLs", route.upstream);
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Empty::new().map_err(|e| match e {}).boxed())
+                .unwrap());
+        }
     };
 
     let upstream_base = upstream_url_str.parse::<Uri>()?;
 
-    // --- 下面的逻辑保持不变 ---
-    let path = req.uri().path();
+    // 6. 路径重写 (Path Rewriting)
+    // 处理 path_query，如果有 query string 也要带上
     let path_query = req
         .uri()
         .path_and_query()
         .map(|pq| pq.as_str())
-        .unwrap_or(path);
+        .unwrap_or(req_path);
 
+    // 计算最终发给上游的 Path
+    let final_path = if route.strip_prefix {
+        // 如果开启了 strip_prefix，把路由前缀去掉
+        // 比如：req: /api/v1/get, route: /api/v1 -> new: /get
+        info!("&route.path: {}", &route.path);
+        if let Some(stripped) = path_query.strip_prefix(&route.path) {
+            // 确保以 / 开头
+            info!("stripped {}", stripped);
+            if !stripped.starts_with('/') {
+                format!("/{}", stripped)
+            } else {
+                stripped.to_string()
+            }
+        } else {
+            path_query.to_string()
+        }
+    } else {
+        path_query.to_string()
+    };
+
+    // 7. 拼接最终 URL
     let base_str = upstream_base.to_string();
     let base_trimmed = base_str.trim_end_matches('/');
-    let uri_string = format!("{}{}", base_trimmed, path_query);
-    let new_uri: Uri = uri_string.parse()?;
+    let uri_string = format!("{}{}", base_trimmed, final_path);
 
+    let new_uri: Uri = uri_string.parse()?;
     *req.uri_mut() = new_uri;
 
+    // 8. 设置 Host 头 (这对 SNI 至关重要)
     if let Some(host) = upstream_base.host() {
         req.headers_mut().insert("host", host.parse()?);
     }
+
     req.headers_mut()
         .insert("x-forwarded-for", remote_addr.ip().to_string().parse()?);
 
-    info!("Forwarding to: {}", req.uri());
+    info!(
+        "Matched route: '{}' -> '{}', forwarding to: {}",
+        route.path,
+        route.upstream,
+        req.uri()
+    );
 
+    // 9. 发送请求
     let req_body = req.map(|b| b.map_err(|e| Box::new(e) as ProxyError).boxed());
 
     match client.request(req_body).await {
         Ok(res) => {
-            info!("Upstream response: {}", res.status());
             let res_boxed = res.map(|b| b.map_err(|e| Box::new(e) as ProxyError).boxed());
             Ok(res_boxed)
         }
@@ -289,6 +353,9 @@ struct UpstreamConfig {
 struct RouteConfig {
     path: String,
     upstream: String,
+    // 默认为 false，如果配置文件未定义，就是 false
+    #[serde(default)]
+    strip_prefix: bool,
 }
 
 // === 命令行参数定义 ===
