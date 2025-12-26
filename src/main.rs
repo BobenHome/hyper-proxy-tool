@@ -12,7 +12,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tower::service_fn;
 use tower::{BoxError, ServiceBuilder, ServiceExt};
@@ -31,6 +31,10 @@ use serde::Deserialize;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+// === 新增 Metrics 引用 ===
+use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
+use metrics_exporter_prometheus::PrometheusBuilder;
+
 // 定义通用错误
 type ProxyError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -42,6 +46,21 @@ async fn main() -> Result<(), ProxyError> {
     tracing_subscriber::fmt()
         .with_env_filter("hyper_proxy_tool=info")
         .init();
+
+    // ================== 新增：初始化 Prometheus ==================
+    // 监听 0.0.0.0:9000，提供 /metrics 接口
+    // 这启动了一个后台 Future，不阻塞主线程
+    let builder = PrometheusBuilder::new();
+    builder
+        .with_http_listener(([0, 0, 0, 0], 9000))
+        .install()
+        .expect("failed to install Prometheus recorder");
+
+    info!("Metrics endpoint exposed at http://0.0.0.0:9000/metrics");
+    // ============================================================
+
+    // 指标自描述
+    init_metrics();
 
     let args = Cli::parse();
     info!("Loading config from: {}", args.config);
@@ -102,6 +121,12 @@ async fn main() -> Result<(), ProxyError> {
         let config = config.clone();
 
         tokio::spawn(async move {
+            // === 埋点开始 ===
+            // 只要这一行执行，active_connections 就会 +1
+            // 只要这个变量销毁，active_connections 就会 -1
+            let _guard = ConnectionGuard::new();
+            // === 埋点结束 ===
+
             let tls_stream = match tls_acceptor.accept(tcp_stream).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -149,6 +174,10 @@ async fn proxy_handler(
     config: Arc<AppConfig>,
     remote_addr: SocketAddr,
 ) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError> {
+    // 1. 开始计时
+    let start = Instant::now();
+    let method = req.method().to_string();
+
     // 1. 健康检查
     if req.uri().path() == "/health" {
         let body = Full::new(Bytes::from("OK (Dynamic Routing)"))
@@ -168,11 +197,18 @@ async fn proxy_handler(
         }
     }
 
+    // 提取 upstream 名称用于 Label，如果没有匹配则是 "unknown"
+    let upstream_name = matched_route
+        .map(|r| r.upstream.as_str())
+        .unwrap_or("unknown");
+
     // 3. 处理 404 (如果没有匹配到任何路由)
     let route = match matched_route {
         Some(r) => r,
         None => {
             info!("No route matched for path: {}", req_path);
+            record_metrics(&method, "404", upstream_name, start);
+
             let body = Full::new(Bytes::from("404 Not Found (Hyper Proxy)"))
                 .map_err(|e| match e {})
                 .boxed();
@@ -187,6 +223,8 @@ async fn proxy_handler(
         Some(u) => u,
         None => {
             error!("Upstream '{}' not found in config", route.upstream);
+            record_metrics(&method, "500", upstream_name, start);
+
             let body = Full::new(Bytes::from("500 Config Error: Upstream Not Found"))
                 .map_err(|e| match e {})
                 .boxed();
@@ -278,17 +316,64 @@ async fn proxy_handler(
 
     match client.request(req_body).await {
         Ok(res) => {
+            // 记录成功指标
+            let status = res.status().as_u16().to_string();
+            record_metrics(&method, &status, upstream_name, start);
+
             let res_boxed = res.map(|b| b.map_err(|e| Box::new(e) as ProxyError).boxed());
             Ok(res_boxed)
         }
         Err(err) => {
             error!("Upstream request failed: {:?}", err);
+            record_metrics(&method, "502", upstream_name, start);
+
             let body = Empty::<Bytes>::new().map_err(|e| match e {}).boxed();
             let mut resp = Response::new(body);
             *resp.status_mut() = StatusCode::BAD_GATEWAY;
             Ok(resp)
         }
     }
+}
+
+// === 辅助函数：统一记录指标 ===
+fn record_metrics(method: &str, status: &str, upstream: &str, start: Instant) {
+    let duration = start.elapsed().as_secs_f64();
+
+    // 1. 计数器：http_requests_total
+    counter!(
+        "http_requests_total",
+        "method" => method.to_string(),
+        "status" => status.to_string(),
+        "upstream" => upstream.to_string()
+    )
+    .increment(1);
+
+    // 2. 直方图：http_request_duration_seconds
+    histogram!(
+        "http_request_duration_seconds",
+        "method" => method.to_string(),
+        "status" => status.to_string(),
+        "upstream" => upstream.to_string()
+    )
+    .record(duration);
+}
+
+// 在 main 函数初始化阶段执行一次
+fn init_metrics() {
+    describe_counter!(
+        "http_requests_total",
+        "The total number of HTTP requests handled by the proxy."
+    );
+
+    describe_histogram!(
+        "http_request_duration_seconds",
+        "The response latency distribution in seconds."
+    );
+
+    describe_gauge!(
+        "active_connections",
+        "Current number of active TCP connections."
+    );
 }
 
 /// 加载证书
@@ -379,4 +464,24 @@ struct Cli {
     /// 配置文件路径
     #[arg(short, long, default_value = "config.toml")]
     config: String,
+}
+
+/// 连接守卫
+/// 创建时：活跃连接 +1
+/// 销毁时(Drop)：活跃连接 -1
+struct ConnectionGuard;
+
+impl ConnectionGuard {
+    fn new() -> Self {
+        // 写法变更：先获取句柄，再调用方法
+        gauge!("active_connections").increment(1.0);
+        Self
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        // 写法变更：先获取句柄，再调用方法
+        gauge!("active_connections").decrement(1.0);
+    }
 }
