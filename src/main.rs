@@ -5,7 +5,6 @@ use hyper::{Request, Response, StatusCode, Uri};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto;
 use hyper_util::service::TowerToHyperService;
 use std::convert::Infallible;
 use std::fs::File;
@@ -30,6 +29,8 @@ use clap::Parser;
 use serde::Deserialize;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+use tokio::io::copy_bidirectional;
 
 // === 新增 Metrics 引用 ===
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
@@ -81,6 +82,7 @@ async fn main() -> Result<(), ProxyError> {
         .with_single_cert(certs, key)
         .map_err(|e| error(format!("{}", e)))?;
     server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    // server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
     let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
 
     let https_connector = HttpsConnectorBuilder::new()
@@ -127,6 +129,7 @@ async fn main() -> Result<(), ProxyError> {
             let _guard = ConnectionGuard::new();
             // === 埋点结束 ===
 
+            // 1. TLS 握手
             let tls_stream = match tls_acceptor.accept(tcp_stream).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -134,6 +137,15 @@ async fn main() -> Result<(), ProxyError> {
                     return;
                 }
             };
+
+            // 2. 【核心逻辑】检查 ALPN 协商结果
+            // tls_stream.get_ref() 返回 (IO, Connection)
+            // .1 获取 Connection，.alpn_protocol() 获取协商出的协议
+            let alpn_proto = tls_stream.get_ref().1.alpn_protocol().map(|p| p.to_vec());
+
+            // 判断是否协商出了 h2
+            let is_h2 = alpn_proto.as_deref() == Some(b"h2");
+
             let io = TokioIo::new(tls_stream);
 
             let proxy_service = service_fn(move |req| {
@@ -158,10 +170,30 @@ async fn main() -> Result<(), ProxyError> {
             });
 
             let hyper_service = TowerToHyperService::new(tower_service);
-            let builder = auto::Builder::new(TokioExecutor::new());
 
-            if let Err(err) = builder.serve_connection(io, hyper_service).await {
-                error!("Connection error: {:?}", err);
+            // 3. 根据协议动态选择 Builder
+            if is_h2 {
+                // === HTTP/2 分支 ===
+                // 优点：多路复用，高性能
+                // 缺点：Hyper 1.0 的 H2 Builder 目前不支持传统的 upgrade::on 劫持
+                //       所以在此模式下，WebSocket 请求会失败 (或需要实现 RFC 8441)
+                info!("Serving connection using HTTP/2");
+                let builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+
+                if let Err(err) = builder.serve_connection(io, hyper_service).await {
+                    error!("H2 Connection error: {:?}", err);
+                }
+            } else {
+                // === HTTP/1.1 分支 ===
+                // 优点：支持 Upgrade，支持 WebSocket
+                info!("Serving connection using HTTP/1.1");
+                let conn = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, hyper_service)
+                    .with_upgrades(); // 关键：开启升级支持
+
+                if let Err(err) = conn.await {
+                    error!("H1 Connection error: {:?}", err);
+                }
             }
         });
     }
@@ -261,6 +293,13 @@ async fn proxy_handler(
     );
 
     let upstream_base = upstream_url_str.parse::<Uri>()?;
+
+    // ================== 新增：检测 WebSocket ==================
+    if is_websocket_request(&req) {
+        // 注意：我们这里把 req 的所有权移交出去了，所以必须在这之前完成所有需要 req 的逻辑
+        return handle_websocket(req, client, upstream_base).await;
+    }
+    // ========================================================
 
     // 6. 路径重写 (Path Rewriting)
     // 处理 path_query，如果有 query string 也要带上
@@ -483,5 +522,134 @@ impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         // 写法变更：先获取句柄，再调用方法
         gauge!("active_connections").decrement(1.0);
+    }
+}
+
+fn is_websocket_request(req: &Request<Incoming>) -> bool {
+    // 检查 Connection 头是否包含 "upgrade"
+    let has_connection_upgrade = req
+        .headers()
+        .get("connection")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_ascii_lowercase().contains("upgrade"))
+        .unwrap_or(false);
+
+    // 检查 Upgrade 头是否是 "websocket"
+    let has_upgrade_websocket = req
+        .headers()
+        .get("upgrade")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_ascii_lowercase() == "websocket")
+        .unwrap_or(false);
+
+    has_connection_upgrade && has_upgrade_websocket
+}
+
+// 处理 WebSocket 升级的核心逻辑
+async fn handle_websocket(
+    req: Request<Incoming>,
+    client: Arc<HttpClient>,
+    upstream_base: Uri,
+) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError> {
+    info!("Detected WebSocket upgrade request");
+
+    // 1. 构造发往上游的请求
+    // 我们需要手动要把 req 的 header 复制到一个新的 Request 中
+    // 因为原本的 req 需要保留下来，用于后续的 upgrade::on(req) 获取客户端 IO
+    let path = req.uri().path();
+    let path_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or(path);
+
+    let base_str = upstream_base.to_string();
+    let base_trimmed = base_str.trim_end_matches('/');
+    let uri_string = format!("{}{}", base_trimmed, path_query);
+    let new_uri = uri_string.parse::<Uri>()?;
+
+    let mut upstream_req_builder = Request::builder()
+        .method(req.method())
+        .uri(new_uri)
+        .version(req.version());
+
+    // 复制 Header
+    for (k, v) in req.headers() {
+        upstream_req_builder = upstream_req_builder.header(k, v);
+    }
+
+    // 强制设置 Host (如果上游需要 SNI)
+    if let Some(host) = upstream_base.host() {
+        upstream_req_builder = upstream_req_builder.header("Host", host);
+    }
+
+    // WebSocket 握手请求通常没有 Body，或者 Body 为空
+    let upstream_req =
+        upstream_req_builder.body(Empty::<Bytes>::new().map_err(|e| match e {}).boxed())?;
+
+    // 2. 发送请求给上游
+    let res = client.request(upstream_req).await?;
+
+    // 3. 检查上游是否同意升级 (Status 101)
+    if res.status() == StatusCode::SWITCHING_PROTOCOLS {
+        info!("Upstream accepted WebSocket upgrade (101)");
+
+        // 4. 构造返回给客户端的 101 响应
+        let mut client_res_builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+
+        // 复制上游返回的 Upgrade 相关 Header 给客户端
+        for (k, v) in res.headers() {
+            client_res_builder = client_res_builder.header(k, v);
+        }
+
+        let client_res =
+            client_res_builder.body(Empty::<Bytes>::new().map_err(|e| match e {}).boxed())?;
+
+        // 5. 【核心黑魔法】开启后台任务，进行双向隧道传输
+        tokio::spawn(async move {
+            // A. 获取客户端的底层 IO (Upgrade Future)
+            let upgraded_client = match hyper::upgrade::on(req).await {
+                Ok(upgraded) => upgraded,
+                Err(e) => {
+                    error!("Client upgrade error: {}", e);
+                    return;
+                }
+            };
+
+            // B. 获取上游的底层 IO (Upgrade Future)
+            let upgraded_upstream = match hyper::upgrade::on(res).await {
+                Ok(upgraded) => upgraded,
+                Err(e) => {
+                    error!("Upstream upgrade error: {}", e);
+                    return;
+                }
+            };
+
+            // C. 转换为 Tokio 兼容的 IO (Hyper 1.0 的 IO 是实现了 hyper::rt::Io 的，tokio 需要 AsyncRead/Write)
+            let mut client_io = TokioIo::new(upgraded_client);
+            let mut upstream_io = TokioIo::new(upgraded_upstream);
+
+            // D. 建立双向管道，直到一方断开
+            info!("WebSocket tunnel established");
+            match copy_bidirectional(&mut client_io, &mut upstream_io).await {
+                Ok((from_client, from_server)) => {
+                    info!(
+                        "WebSocket tunnel closed. Client sent: {} bytes, Server sent: {} bytes",
+                        from_client, from_server
+                    );
+                }
+                Err(e) => {
+                    error!("WebSocket tunnel error: {}", e);
+                }
+            }
+        });
+
+        // 立即返回 101 响应给客户端，触发客户端的 Upgrade 逻辑
+        Ok(client_res)
+    } else {
+        // 如果上游拒绝升级 (比如返回 403)，则当作普通 HTTP 请求处理，直接透传响应
+        info!("Upstream rejected upgrade: {}", res.status());
+        let res_boxed = res.map(|b| b.map_err(|e| Box::new(e) as ProxyError).boxed());
+        Ok(res_boxed)
     }
 }

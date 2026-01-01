@@ -13,11 +13,19 @@ urls = [
   "https://postman-echo.com"
 ]
 
-[upstreams.local]
-urls = ["http://127.0.0.1:9090"]
+# 1. 定义本地 WS 上游
+[upstreams.local_ws]
+# 注意：虽然是 WebSocket，但底层建立连接时是 TCP/HTTP，
+# 所以这里写 http:// 即可，hyper 会处理握手。
+urls = ["http://127.0.0.1:9001"]
 
 # === 路由规则===
 [[routes]]
 path = "/api/v1"
 upstream = "httpbin_cluster"
 strip_prefix = true
+
+[[routes]]
+path = "/ws"
+upstream = "local_ws"
+strip_prefix = false
