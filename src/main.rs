@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 use tower::service_fn;
 use tower::{BoxError, ServiceBuilder, ServiceExt};
 use tower_http::trace::TraceLayer;
-use tracing::{error, info, instrument};
+use tracing::{error, info, instrument, warn};
 
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -201,7 +201,7 @@ async fn main() -> Result<(), ProxyError> {
 
 #[instrument(skip(client, config, req), fields(method = %req.method(), uri = %req.uri()))]
 async fn proxy_handler(
-    mut req: Request<Incoming>,
+    req: Request<Incoming>,
     client: Arc<HttpClient>,
     config: Arc<AppConfig>,
     remote_addr: SocketAddr,
@@ -209,6 +209,7 @@ async fn proxy_handler(
     // 1. 开始计时
     let start = Instant::now();
     let method = req.method().to_string();
+    let method_str = method.to_string();
 
     // 1. 健康检查
     if req.uri().path() == "/health" {
@@ -218,7 +219,7 @@ async fn proxy_handler(
         return Ok(Response::new(body));
     }
 
-    let req_path = req.uri().path();
+    let req_path = req.uri().path().to_string();
 
     // 2. 路由匹配逻辑 (First Match Wins)
     let mut matched_route: Option<&RouteConfig> = None;
@@ -275,41 +276,30 @@ async fn proxy_handler(
             .unwrap());
     }
 
-    // 1. fetch_add(1) 原子地将计数器 +1，并返回旧值。
-    //    Ordering::Relaxed 性能最好，对于负载均衡来说不需要严格的内存顺序，只要唯一即可。
-    // 2. 取模运算 (%) 确保索引永远在 [0, len-1] 范围内。
-    let current_count = upstream_config.counter.fetch_add(1, Ordering::Relaxed);
-    let index = current_count % upstream_config.urls.len();
-
-    let upstream_url_str = &upstream_config.urls[index];
-
-    info!(
-        "Load Balancing: Route '{}' -> Upstream '{}' ({}/{}) -> {}",
-        route.path,
-        route.upstream,
-        index + 1,
-        upstream_config.urls.len(),
-        upstream_url_str
-    );
-
-    let upstream_base = upstream_url_str.parse::<Uri>()?;
-
     // ================== 新增：检测 WebSocket ==================
     if is_websocket_request(&req) {
+        let current_count = upstream_config.counter.fetch_add(1, Ordering::Relaxed);
+        let index = current_count % upstream_config.urls.len();
+        let upstream_url_str = &upstream_config.urls[index];
+        let upstream_base = upstream_url_str.parse::<Uri>()?;
         // 注意：我们这里把 req 的所有权移交出去了，所以必须在这之前完成所有需要 req 的逻辑
+        info!("WebSocket Load Balancing: -> {}", upstream_url_str);
         return handle_websocket(req, client, upstream_base).await;
     }
     // ========================================================
 
-    // 6. 路径重写 (Path Rewriting)
-    // 处理 path_query，如果有 query string 也要带上
+    // ========================================================
+
+    // 提前计算 path_query 字符串并持有所有权
+    // 在 req 被消耗前完成
     let path_query = req
         .uri()
         .path_and_query()
         .map(|pq| pq.as_str())
-        .unwrap_or(req_path);
+        .unwrap_or(&req_path)
+        .to_string();
 
-    // 计算最终发给上游的 Path
+    // 6. 路径重写 (Path Rewriting)
     let final_path = if route.strip_prefix {
         // 如果开启了 strip_prefix，把路由前缀去掉
         // 比如：req: /api/v1/get, route: /api/v1 -> new: /get
@@ -321,57 +311,130 @@ async fn proxy_handler(
                 stripped.to_string()
             }
         } else {
-            path_query.to_string()
+            path_query.clone()
         }
     } else {
-        path_query.to_string()
+        path_query.clone()
     };
 
-    // 7. 拼接最终 URL
-    let base_str = upstream_base.to_string();
-    let base_trimmed = base_str.trim_end_matches('/');
-    let uri_string = format!("{}{}", base_trimmed, final_path);
+    // ================== 核心修复：拆解 Request ==================
 
-    let new_uri: Uri = uri_string.parse()?;
-    *req.uri_mut() = new_uri;
+    // 1. 拆解 Request
+    // parts: 包含 Headers, Method, Version 等
+    // body: 数据流
+    let (parts, body) = req.into_parts();
 
-    // 8. 设置 Host 头 (这对 SNI 至关重要)
-    if let Some(host) = upstream_base.host() {
-        req.headers_mut().insert("host", host.parse()?);
+    // 2. 读取 Body (消耗 body)
+    // 此时 req 已经不存在了，但我们有了 parts 和 body_bytes
+    let body_bytes = body.collect().await?.to_bytes();
+    let body_full = Full::new(body_bytes);
+
+    // ================== 故障转移循环 ==================
+
+    let max_failover_attempts = upstream_config.urls.len();
+    let mut last_error: Option<ProxyError> = None;
+
+    for attempt in 0..max_failover_attempts {
+        // 1. 选取节点
+        let current_count = upstream_config.counter.fetch_add(1, Ordering::Relaxed);
+        let index = current_count % upstream_config.urls.len();
+        let upstream_url_str = &upstream_config.urls[index];
+
+        let upstream_base = match upstream_url_str.parse::<Uri>() {
+            Ok(u) => u,
+            Err(e) => {
+                error!("Invalid upstream URL: {}", e);
+                continue;
+            }
+        };
+
+        info!(
+            "Attempt {}/{}: Routing to {}",
+            attempt + 1,
+            max_failover_attempts,
+            upstream_url_str
+        );
+
+        // 2. URL 拼接
+        let base_str = upstream_base.to_string();
+        let base_trimmed = base_str.trim_end_matches('/');
+        let uri_string = format!("{}{}", base_trimmed, final_path);
+        let new_uri = match uri_string.parse::<Uri>() {
+            Ok(u) => u,
+            Err(e) => {
+                error!("Invalid constructed URI: {}", e);
+                continue;
+            }
+        };
+
+        // 3. 构造请求 Builder (使用 parts)
+        // 使用 parts.method 和 parts.version
+        let mut builder = Request::builder()
+            .method(parts.method.clone())
+            .uri(new_uri)
+            .version(parts.version);
+
+        // 使用 parts.headers
+        for (k, v) in &parts.headers {
+            builder = builder.header(k, v);
+        }
+        if let Some(host) = upstream_base.host() {
+            builder = builder.header("Host", host);
+        }
+        builder = builder.header("x-forwarded-for", remote_addr.ip().to_string());
+
+        let retry_req = match builder.body(body_full.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Failed to build request: {}", e);
+                continue;
+            }
+        };
+
+        // 4. 构建 Service
+        let retry_service = ServiceBuilder::new()
+            .layer(tower::retry::RetryLayer::new(ProxyRetryPolicy::new(3)))
+            .service(service_fn(|req: Request<Full<Bytes>>| {
+                let client = client.clone();
+                async move {
+                    let (parts, body) = req.into_parts();
+                    let boxed_body = body.map_err(|e| match e {}).boxed();
+                    let new_req = Request::from_parts(parts, boxed_body);
+                    client.request(new_req).await
+                }
+            }));
+
+        // 5. 发送请求
+        match retry_service.oneshot(retry_req).await {
+            Ok(res) => {
+                let status = res.status().as_u16().to_string();
+                record_metrics(&method_str, &status, upstream_name, start);
+
+                let res_boxed =
+                    res.map(|b: Incoming| b.map_err(|e| Box::new(e) as ProxyError).boxed());
+                return Ok(res_boxed);
+            }
+            Err(err) => {
+                warn!(
+                    "Upstream {} failed after retries: {:?}. Trying next node...",
+                    upstream_url_str, err
+                );
+                last_error = Some(Box::new(err));
+            }
+        }
     }
 
-    req.headers_mut()
-        .insert("x-forwarded-for", remote_addr.ip().to_string().parse()?);
-
-    info!(
-        "Matched route: '{}' -> '{}', forwarding to: {}",
-        route.path,
-        route.upstream,
-        req.uri()
+    // ================== 全部失败 ==================
+    error!(
+        "All upstreams failed for route '{}'. Last error: {:?}",
+        route.path, last_error
     );
+    record_metrics(&method_str, "502", upstream_name, start);
 
-    // 9. 发送请求
-    let req_body = req.map(|b| b.map_err(|e| Box::new(e) as ProxyError).boxed());
-
-    match client.request(req_body).await {
-        Ok(res) => {
-            // 记录成功指标
-            let status = res.status().as_u16().to_string();
-            record_metrics(&method, &status, upstream_name, start);
-
-            let res_boxed = res.map(|b| b.map_err(|e| Box::new(e) as ProxyError).boxed());
-            Ok(res_boxed)
-        }
-        Err(err) => {
-            error!("Upstream request failed: {:?}", err);
-            record_metrics(&method, "502", upstream_name, start);
-
-            let body = Empty::<Bytes>::new().map_err(|e| match e {}).boxed();
-            let mut resp = Response::new(body);
-            *resp.status_mut() = StatusCode::BAD_GATEWAY;
-            Ok(resp)
-        }
-    }
+    let body = Empty::<Bytes>::new().map_err(|e| match e {}).boxed();
+    let mut resp = Response::new(body);
+    *resp.status_mut() = StatusCode::BAD_GATEWAY;
+    Ok(resp)
 }
 
 // === 辅助函数：统一记录指标 ===
@@ -651,5 +714,66 @@ async fn handle_websocket(
         info!("Upstream rejected upgrade: {}", res.status());
         let res_boxed = res.map(|b| b.map_err(|e| Box::new(e) as ProxyError).boxed());
         Ok(res_boxed)
+    }
+}
+
+use std::future;
+use tower::retry::Policy;
+
+#[derive(Clone)]
+struct ProxyRetryPolicy {
+    /// 最大重试次数
+    max_attempts: usize,
+}
+
+impl ProxyRetryPolicy {
+    fn new(max_attempts: usize) -> Self {
+        Self { max_attempts }
+    }
+}
+
+// 不再使用泛型 Res，直接指定为 Response<Incoming>
+// E 依然泛型，只要能转成 BoxError 即可
+impl<B, E> Policy<Request<B>, Response<Incoming>, E> for ProxyRetryPolicy
+where
+    B: Clone,
+    E: Into<BoxError>,
+{
+    type Future = future::Ready<()>;
+
+    fn retry(
+        &mut self,
+        _req: &mut Request<B>,
+        result: &mut Result<Response<Incoming>, E>,
+    ) -> Option<Self::Future> {
+        if self.max_attempts == 0 {
+            return None;
+        }
+
+        let should_retry = match result {
+            // 直接使用 res，不需要 as_ref()
+            Ok(res) => res.status().is_server_error(),
+            Err(_) => true,
+        };
+
+        if should_retry {
+            self.max_attempts -= 1;
+            Some(future::ready(()))
+        } else {
+            None
+        }
+    }
+
+    fn clone_request(&mut self, req: &Request<B>) -> Option<Request<B>> {
+        let mut builder = Request::builder()
+            .method(req.method())
+            .uri(req.uri())
+            .version(req.version());
+
+        for (k, v) in req.headers() {
+            builder = builder.header(k, v);
+        }
+
+        builder.body(req.body().clone()).ok()
     }
 }
