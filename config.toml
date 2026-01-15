@@ -10,7 +10,7 @@ key_file = "key.pem"
 [upstreams.httpbin_cluster]
 urls = [
   "https://httpbin.org",
-  "https://postman-echo1.com"
+  "https://postman-echo.com"
 ]
 
 # 1. 定义本地 WS 上游
