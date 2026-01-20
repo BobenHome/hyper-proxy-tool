@@ -3,7 +3,8 @@ use bytes::Bytes;
 use clap::Parser;
 use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::body::Incoming;
-use hyper::{Request, Response, StatusCode, Uri};
+use hyper::header::CONTENT_LENGTH;
+use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -50,6 +51,10 @@ struct AppState {
 }
 
 // ===============================================
+
+// 定义缓冲阈值：64KB
+// 超过这个大小的请求将走流式传输，不进行重试
+const MAX_BUFFER_SIZE: u64 = 64 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<(), ProxyError> {
@@ -362,13 +367,14 @@ async fn proxy_handler(
         None => {
             info!("No route matched for path: {}", req_path);
             record_metrics(&method, "404", upstream_name, start);
-
-            let body = Full::new(Bytes::from("404 Not Found (Hyper Proxy)"))
-                .map_err(|e| match e {})
-                .boxed();
-            let mut resp = Response::new(body);
-            *resp.status_mut() = StatusCode::NOT_FOUND;
-            return Ok(resp);
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(
+                    Full::new(Bytes::from("404 Not Found"))
+                        .map_err(|e| match e {})
+                        .boxed(),
+                )
+                .unwrap());
         }
     };
 
@@ -378,18 +384,14 @@ async fn proxy_handler(
         None => {
             error!("Upstream '{}' not found in state", route.upstream);
             record_metrics(&method, "500", upstream_name, start);
-
-            let body = Full::new(Bytes::from("500 State Error: Upstream Not Found"))
-                .map_err(|e| match e {})
-                .boxed();
-            let mut resp = Response::new(body);
-            *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-            return Ok(resp);
-
-            // return Ok(Response::builder()
-            //     .status(StatusCode::INTERNAL_SERVER_ERROR)
-            //     .body(body)
-            //     .unwrap());
+            return Ok(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(
+                    Full::new(Bytes::from("500 Config Error"))
+                        .map_err(|e| match e {})
+                        .boxed(),
+                )
+                .unwrap());
         }
     };
 
@@ -429,7 +431,25 @@ async fn proxy_handler(
     }
     // ========================================================
 
-    // ========================================================
+    // ================== 判断是否应该缓冲 Body ==================
+    let content_length = req
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+
+    let should_buffer = if let Some(len) = content_length {
+        // 场景 A: 有明确长度，检查是否小于阈值，才缓冲并启用重试
+        len <= MAX_BUFFER_SIZE
+    } else {
+        // 场景 B: 没有 Content-Length
+        // 对于 GET/HEAD 等通常无 Body 的方法，我们应该缓冲 (Body 实际上是空的，开销为 0)
+        // 对于 POST/PUT，如果没有 Length，通常是 Chunked 传输，可能很大，走流式
+        match *req.method() {
+            Method::GET | Method::HEAD | Method::OPTIONS | Method::DELETE => true,
+            _ => false,
+        }
+    };
 
     // 提前计算 path_query 字符串并持有所有权
     // 在 req 被消耗前完成
@@ -461,35 +481,111 @@ async fn proxy_handler(
     // 7. 拆解 Request 并缓冲 Body
     let (parts, body) = req.into_parts();
 
-    // 读取 Body (消耗 body)
-    // 此时 req 已经不存在了，但我们有了 parts 和 body_bytes
-    let body_bytes = body.collect().await?.to_bytes();
-    let body_full = Full::new(body_bytes);
+    // ================== 分支逻辑 ==================
+    if should_buffer {
+        // >>> 分支 A: 缓冲模式 (支持重试 + 故障转移) <<<
+        let body_bytes = body.collect().await?.to_bytes();
+        let body_full = Full::new(body_bytes);
 
-    // ================== 故障转移循环 ==================
-    let max_failover_attempts = active_urls.len();
-    let mut last_error: Option<ProxyError> = None;
+        // 故障转移循环 (代码复用上一版，略微精简注释)
+        let max_failover_attempts = active_urls.len();
+        let mut last_error: Option<ProxyError> = None;
 
-    for attempt in 0..max_failover_attempts {
-        // Round Robin 选址
+        for attempt in 0..max_failover_attempts {
+            let current_count = upstream_state.counter.fetch_add(1, Ordering::Relaxed);
+            let index = current_count % active_urls.len();
+            let upstream_url_str = &active_urls[index];
+
+            // 构造 URI
+            let upstream_base = match upstream_url_str.parse::<Uri>() {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+            let base_str = upstream_base.to_string();
+            let base_trimmed = base_str.trim_end_matches('/');
+            let uri_string = format!("{}{}", base_trimmed, final_path);
+            let new_uri = match uri_string.parse::<Uri>() {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+
+            info!(
+                "Attempt {}/{}: Routing to {} (Buffered)",
+                attempt + 1,
+                max_failover_attempts,
+                upstream_url_str
+            );
+
+            // 构造请求
+            let mut builder = Request::builder()
+                .method(parts.method.clone())
+                .uri(new_uri)
+                .version(parts.version);
+            for (k, v) in &parts.headers {
+                builder = builder.header(k, v);
+            }
+            if let Some(host) = upstream_base.host() {
+                builder = builder.header("Host", host);
+            }
+            builder = builder.header("x-forwarded-for", remote_addr.ip().to_string());
+
+            let retry_req = match builder.body(body_full.clone()) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            // 使用 Tower Retry
+            let retry_service = ServiceBuilder::new()
+                .layer(tower::retry::RetryLayer::new(ProxyRetryPolicy::new(3)))
+                .service(service_fn(|req: Request<Full<Bytes>>| {
+                    let client = client.clone();
+                    async move {
+                        let (parts, body) = req.into_parts();
+                        let boxed_body = body.map_err(|e| match e {}).boxed();
+                        client.request(Request::from_parts(parts, boxed_body)).await
+                    }
+                }));
+
+            match retry_service.oneshot(retry_req).await {
+                Ok(res) => {
+                    let status = res.status().as_u16().to_string();
+                    record_metrics(&method_str, &status, upstream_name, start);
+                    return Ok(res.map(|b| b.map_err(|e| Box::new(e) as ProxyError).boxed()));
+                }
+                Err(err) => {
+                    warn!(
+                        "Upstream {} failed: {:?}. Switching node...",
+                        upstream_url_str, err
+                    );
+                    last_error = Some(Box::new(err));
+                }
+            }
+        }
+
+        // 循环结束仍失败
+        error!("All upstreams failed. Last: {:?}", last_error);
+        record_metrics(&method_str, "502", upstream_name, start);
+        return Ok(Response::builder()
+            .status(502)
+            .body(Empty::new().map_err(|e| match e {}).boxed())
+            .unwrap());
+    } else {
+        // >>> 分支 B: 流式模式 (无重试，低内存) <<<
+
+        // 1. 选址 (只选一次，不支持故障转移，因为 body 流不能倒带)
         let current_count = upstream_state.counter.fetch_add(1, Ordering::Relaxed);
         let index = current_count % active_urls.len();
         let upstream_url_str = &active_urls[index];
 
         let upstream_base = match upstream_url_str.parse::<Uri>() {
             Ok(u) => u,
-            Err(e) => {
-                error!("Invalid upstream URL: {}", e);
-                continue;
+            Err(_) => {
+                return Ok(Response::builder()
+                    .status(502)
+                    .body(Empty::new().map_err(|e| match e {}).boxed())
+                    .unwrap());
             }
         };
-
-        info!(
-            "Attempt {}/{}: Routing to {}",
-            attempt + 1,
-            max_failover_attempts,
-            upstream_url_str
-        );
 
         // URL 拼接
         let base_str = upstream_base.to_string();
@@ -497,16 +593,19 @@ async fn proxy_handler(
         let uri_string = format!("{}{}", base_trimmed, final_path);
         let new_uri = match uri_string.parse::<Uri>() {
             Ok(u) => u,
-            Err(e) => {
-                error!("URI Error: {}", e);
-                continue;
+            Err(_) => {
+                return Ok(Response::builder()
+                    .status(502)
+                    .body(Empty::new().map_err(|e| match e {}).boxed())
+                    .unwrap());
             }
         };
 
-        // 8. 构造请求 Builder (使用 parts)
-        // 使用 parts.method 和 parts.version
+        info!("Streaming Large Request to {} (No Retry)", upstream_url_str);
+
+        // 2. 构造请求
         let mut builder = Request::builder()
-            .method(parts.method.clone())
+            .method(parts.method) // 直接 move parts，不需要 clone
             .uri(new_uri)
             .version(parts.version);
 
@@ -519,58 +618,35 @@ async fn proxy_handler(
         }
         builder = builder.header("x-forwarded-for", remote_addr.ip().to_string());
 
-        let retry_req = match builder.body(body_full.clone()) {
+        // 直接使用原始的流式 body
+        let streaming_req = match builder.body(body.map_err(|e| Box::new(e) as ProxyError).boxed())
+        {
             Ok(r) => r,
-            Err(e) => {
-                error!("Failed to build request: {}", e);
-                continue;
+            Err(_) => {
+                return Ok(Response::builder()
+                    .status(500)
+                    .body(Empty::new().map_err(|e| match e {}).boxed())
+                    .unwrap());
             }
         };
 
-        // 9.构建单点重试服务
-        let retry_service = ServiceBuilder::new()
-            .layer(tower::retry::RetryLayer::new(ProxyRetryPolicy::new(3)))
-            .service(service_fn(|req: Request<Full<Bytes>>| {
-                let client = client.clone();
-                async move {
-                    let (parts, body) = req.into_parts();
-                    let boxed_body = body.map_err(|e| match e {}).boxed();
-                    let new_req = Request::from_parts(parts, boxed_body);
-                    client.request(new_req).await
-                }
-            }));
-
-        // 10. 发送请求
-        match retry_service.oneshot(retry_req).await {
+        // 3. 直接发送 (不经过 RetryLayer)
+        match client.request(streaming_req).await {
             Ok(res) => {
                 let status = res.status().as_u16().to_string();
                 record_metrics(&method_str, &status, upstream_name, start);
-
-                let res_boxed =
-                    res.map(|b: Incoming| b.map_err(|e| Box::new(e) as ProxyError).boxed());
-                return Ok(res_boxed);
+                Ok(res.map(|b| b.map_err(|e| Box::new(e) as ProxyError).boxed()))
             }
             Err(err) => {
-                warn!(
-                    "Upstream {} failed: {:?}. Switching node...",
-                    upstream_url_str, err
-                );
-                last_error = Some(Box::new(err));
+                error!("Streaming request failed: {:?}", err);
+                record_metrics(&method_str, "502", upstream_name, start);
+                Ok(Response::builder()
+                    .status(502)
+                    .body(Empty::new().map_err(|e| match e {}).boxed())
+                    .unwrap())
             }
         }
     }
-
-    // ================== 全部失败 ==================
-    error!(
-        "All healthy upstreams failed for route '{}'. Last error: {:?}",
-        route.path, last_error
-    );
-    record_metrics(&method_str, "502", upstream_name, start);
-
-    let body = Empty::<Bytes>::new().map_err(|e| match e {}).boxed();
-    let mut resp = Response::new(body);
-    *resp.status_mut() = StatusCode::BAD_GATEWAY;
-    Ok(resp)
 }
 
 // === 辅助函数：统一记录指标 ===
