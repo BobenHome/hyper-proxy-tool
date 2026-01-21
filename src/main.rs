@@ -12,6 +12,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::service::TowerToHyperService;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -21,12 +22,15 @@ use std::fs::File;
 use std::future;
 use std::io::BufReader;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::copy_bidirectional;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
+use tokio_util::sync::CancellationToken;
 use tower::retry::Policy;
 use tower::service_fn;
 use tower::{BoxError, ServiceBuilder, ServiceExt};
@@ -39,7 +43,7 @@ type ProxyError = Box<dyn std::error::Error + Send + Sync + 'static>;
 // 修改 Client 类型
 type HttpClient = Client<HttpsConnector<HttpConnector>, BoxBody<Bytes, ProxyError>>;
 
-// ================== 动态状态管理 ==================
+const MAX_BUFFER_SIZE: u64 = 64 * 1024;
 
 struct UpstreamState {
     active_urls: ArcSwap<Vec<String>>,
@@ -47,14 +51,8 @@ struct UpstreamState {
 }
 
 struct AppState {
-    upstreams: HashMap<String, Arc<UpstreamState>>,
+    upstreams: ArcSwap<HashMap<String, Arc<UpstreamState>>>,
 }
-
-// ===============================================
-
-// 定义缓冲阈值：64KB
-// 超过这个大小的请求将走流式传输，不进行重试
-const MAX_BUFFER_SIZE: u64 = 64 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<(), ProxyError> {
@@ -62,7 +60,6 @@ async fn main() -> Result<(), ProxyError> {
         .with_env_filter("hyper_proxy_tool=info")
         .init();
 
-    // ================== 新增：初始化 Prometheus ==================
     // 监听 0.0.0.0:9000，提供 /metrics 接口
     // 这启动了一个后台 Future，不阻塞主线程
     let builder = PrometheusBuilder::new();
@@ -77,43 +74,30 @@ async fn main() -> Result<(), ProxyError> {
     // 指标自描述
     init_metrics();
 
+    // 2. 初始加载配置
     let args = Cli::parse();
-    info!("Loading config from: {}", args.config);
+    let config_path = args.config.clone();
+    let initial_config = load_config(&config_path)?;
 
-    let config_content = fs::read_to_string(&args.config)
-        .map_err(|e| error(format!("Failed to read config file: {}", e)))?;
+    // 3. 初始化全局状态
+    // 将 Config 和 State 都放入 ArcSwap，以便原子替换
+    let (initial_state_map, _) = create_state_from_config(&initial_config);
 
-    let config: AppConfig = toml::from_str(&config_content)
-        .map_err(|e| error(format!("Failed to parse config TOML: {}", e)))?;
-
-    info!("Config loaded: {:?}", config);
-
-    // 3. 初始化全局状态 AppState
-    let mut upstreams_state = HashMap::new();
-    for (name, u_conf) in &config.upstreams {
-        upstreams_state.insert(
-            name.clone(),
-            Arc::new(UpstreamState {
-                active_urls: ArcSwap::from_pointee(u_conf.urls.clone()),
-                counter: AtomicUsize::new(0),
-            }),
-        );
-    }
+    let app_config = Arc::new(ArcSwap::from_pointee(initial_config));
     let app_state = Arc::new(AppState {
-        upstreams: upstreams_state,
+        upstreams: ArcSwap::new(Arc::new(initial_state_map)),
     });
-    let app_config = Arc::new(config);
 
-    // 4. 初始化业务 Client
-    let certs = load_certs(&app_config.server.cert_file)?;
-    let key = load_private_key(&app_config.server.key_file)?;
+    // 4. 初始化 Client
+    let current_conf = app_config.load();
+    let certs = load_certs(&current_conf.server.cert_file)?;
+    let key = load_private_key(&current_conf.server.key_file)?;
 
     let mut server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| error(format!("{}", e)))?;
     server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    // server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
     let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
 
     let https_connector = HttpsConnectorBuilder::new()
@@ -126,28 +110,89 @@ async fn main() -> Result<(), ProxyError> {
         .build(https_connector);
     let client = Arc::new(client);
 
-    // ================== 启动健康检查后台任务 ==================
-    let health_check_config = app_config.clone();
-    let health_check_state = app_state.clone();
+    // ================== 配置热加载与健康检查管理 ==================
+    let (tx, mut rx) = mpsc::channel(1);
 
-    // 健康检查专用 Client (短超时)
-    let health_connector = HttpsConnectorBuilder::new()
-        .with_native_roots()?
-        .https_or_http()
-        .enable_all_versions()
-        .build();
-    let health_client = Client::builder(TokioExecutor::new())
-        .pool_idle_timeout(Duration::from_secs(5))
-        .build(health_connector);
-    let health_client = Arc::new(health_client);
+    // 启动文件监听器
+    let mut watcher = RecommendedWatcher::new(
+        move |res| {
+            let _ = tx.blocking_send(res);
+        },
+        notify::Config::default(),
+    )?;
+
+    watcher.watch(Path::new(&config_path), RecursiveMode::NonRecursive)?;
+
+    let manager_config = app_config.clone();
+    let manager_state = app_state.clone();
+    let manager_client = client.clone();
+    let config_file_path = config_path.clone();
 
     tokio::spawn(async move {
-        start_health_check_loop(health_check_config, health_check_state, health_client).await;
+        // 1. 启动初始的健康检查任务
+        let mut cancel_token = CancellationToken::new();
+        let mut health_handle = tokio::spawn(start_health_check_loop(
+            manager_config.clone(),
+            manager_state.clone(),
+            manager_client.clone(),
+            cancel_token.clone(),
+        ));
+
+        info!("Configuration watcher started for: {}", config_file_path);
+
+        // 2. 循环等待文件变更事件
+        while let Some(res) = rx.recv().await {
+            match res {
+                Ok(event) => {
+                    if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                        info!("Config file changed, reloading...");
+                        // 稍微延迟，防止文件写入未完成
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+
+                        match load_config(&config_file_path) {
+                            Ok(new_conf) => {
+                                info!("Config reloaded successfully!");
+
+                                // 更新 Config (原子替换)
+                                manager_config.store(Arc::new(new_conf.clone()));
+
+                                // 更新 State
+                                let (new_state_map, _) = create_state_from_config(&new_conf);
+                                manager_state.upstreams.store(Arc::new(new_state_map));
+
+                                // 重启健康检查任务
+
+                                // 1. 发送取消信号给旧任务
+                                cancel_token.cancel();
+
+                                // 2. 等待旧任务彻底结束
+                                let _ = health_handle.await;
+                                info!("Old health check task stopped.");
+
+                                // 3. 启动新任务
+                                info!("Starting new health check task...");
+                                cancel_token = CancellationToken::new();
+                                health_handle = tokio::spawn(start_health_check_loop(
+                                    manager_config.clone(),
+                                    manager_state.clone(),
+                                    manager_client.clone(),
+                                    cancel_token.clone(),
+                                ));
+                            }
+                            Err(e) => {
+                                error!("Failed to reload config: {}. Keeping old config.", e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => error!("Watch error: {:?}", e),
+            }
+        }
     });
-    // =======================================================
 
     // 5. 启动 Server
     let addr: SocketAddr = app_config
+        .load()
         .server
         .listen_addr
         .parse()
@@ -171,13 +216,8 @@ async fn main() -> Result<(), ProxyError> {
         let state = app_state.clone();
 
         tokio::spawn(async move {
-            // === 埋点开始 ===
-            // 只要这一行执行，active_connections 就会 +1
-            // 只要这个变量销毁，active_connections 就会 -1
             let _guard = ConnectionGuard::new();
-            // === 埋点结束 ===
 
-            // 1. TLS 握手
             let tls_stream = match tls_acceptor.accept(tcp_stream).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -186,14 +226,8 @@ async fn main() -> Result<(), ProxyError> {
                 }
             };
 
-            // 2. 【核心逻辑】检查 ALPN 协商结果
-            // tls_stream.get_ref() 返回 (IO, Connection)
-            // .1 获取 Connection，.alpn_protocol() 获取协商出的协议
             let alpn_proto = tls_stream.get_ref().1.alpn_protocol().map(|p| p.to_vec());
-
-            // 判断是否协商出了 h2
             let is_h2 = alpn_proto.as_deref() == Some(b"h2");
-
             let io = TokioIo::new(tls_stream);
 
             let proxy_service = service_fn(move |req| {
@@ -212,7 +246,6 @@ async fn main() -> Result<(), ProxyError> {
                 .concurrency_limit(100)
                 .service(proxy_service);
 
-            // Error Wrapper
             let tower_service = service_fn(move |req| {
                 let inner = inner_service.clone();
                 async move {
@@ -226,26 +259,15 @@ async fn main() -> Result<(), ProxyError> {
 
             let hyper_service = TowerToHyperService::new(tower_service);
 
-            // 3. 根据协议动态选择 Builder
             if is_h2 {
-                // === HTTP/2 分支 ===
-                // 优点：多路复用，高性能
-                // 缺点：Hyper 1.0 的 H2 Builder 目前不支持传统的 upgrade::on 劫持
-                //       所以在此模式下，WebSocket 请求会失败 (或需要实现 RFC 8441)
-                info!("Serving connection using HTTP/2");
                 let builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
-
                 if let Err(err) = builder.serve_connection(io, hyper_service).await {
                     error!("H2 Connection error: {:?}", err);
                 }
             } else {
-                // === HTTP/1.1 分支 ===
-                // 优点：支持 Upgrade，支持 WebSocket
-                info!("Serving connection using HTTP/1.1");
                 let conn = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, hyper_service)
-                    .with_upgrades(); // 关键：开启升级支持
-
+                    .with_upgrades();
                 if let Err(err) = conn.await {
                     error!("H1 Connection error: {:?}", err);
                 }
@@ -254,22 +276,60 @@ async fn main() -> Result<(), ProxyError> {
     }
 }
 
-// ================== 健康检查逻辑 ==================
+// ================== 辅助逻辑：配置加载与状态创建 ==================
+
+fn load_config(path: &str) -> Result<AppConfig, ProxyError> {
+    let config_content = fs::read_to_string(path)
+        .map_err(|e| error(format!("Failed to read config file: {}", e)))?;
+    let config: AppConfig = toml::from_str(&config_content)
+        .map_err(|e| error(format!("Failed to parse config TOML: {}", e)))?;
+    Ok(config)
+}
+
+fn create_state_from_config(config: &AppConfig) -> (HashMap<String, Arc<UpstreamState>>, ()) {
+    let mut upstreams_state = HashMap::new();
+    for (name, u_conf) in &config.upstreams {
+        upstreams_state.insert(
+            name.clone(),
+            Arc::new(UpstreamState {
+                active_urls: ArcSwap::from_pointee(u_conf.urls.clone()),
+                counter: AtomicUsize::new(0),
+            }),
+        );
+    }
+    (upstreams_state, ())
+}
+
+// ================== 健康检查逻辑 (支持取消) ==================
 
 async fn start_health_check_loop(
-    config: Arc<AppConfig>,
+    config: Arc<ArcSwap<AppConfig>>,
     state: Arc<AppState>,
     client: Arc<HttpClient>,
+    token: CancellationToken, // 接收取消令牌
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
 
     loop {
-        interval.tick().await;
+        // 使用 select! 等待
+        tokio::select! {
+            _ = interval.tick() => {
+                // 继续执行
+            }
+            _ = token.cancelled() => {
+                info!("Health check loop stopped.");
+                return;
+            }
+        }
 
-        for (name, upstream_config) in &config.upstreams {
-            if let Some(upstream_state) = state.upstreams.get(name) {
+        // 加载当前配置快照
+        let current_config = config.load();
+        // 加载当前状态快照 (Map)
+        let current_state_map = state.upstreams.load();
+
+        for (name, upstream_config) in &current_config.upstreams {
+            if let Some(upstream_state) = current_state_map.get(name) {
                 let mut healthy_urls = Vec::new();
-
                 for url in &upstream_config.urls {
                     if check_upstream(&client, url).await {
                         healthy_urls.push(url.clone());
@@ -302,7 +362,6 @@ async fn check_upstream(client: &HttpClient, url: &str) -> bool {
         Err(_) => return false,
     };
 
-    // 显式标注类型是个好习惯，保持不变
     let body: BoxBody<Bytes, ProxyError> = Empty::<Bytes>::new().map_err(|e| match e {}).boxed();
 
     let req = Request::builder()
@@ -311,13 +370,8 @@ async fn check_upstream(client: &HttpClient, url: &str) -> bool {
         .body(body)
         .unwrap();
 
-    // 直接使用 tokio::time::timeout
-    // 逻辑：给 client.request(req) 这个 Future 加上 2秒的时间限制
     match tokio::time::timeout(Duration::from_secs(2), client.request(req)).await {
-        // 外层 Ok: 没有超时
-        // 内层 Ok: 请求发送成功，收到了 Response
         Ok(Ok(res)) => res.status().as_u16() < 500,
-        // 其他情况（超时 Err 或 请求失败 Err）都算不健康
         _ => false,
     }
 }
@@ -328,18 +382,16 @@ async fn check_upstream(client: &HttpClient, url: &str) -> bool {
 async fn proxy_handler(
     req: Request<Incoming>,
     client: Arc<HttpClient>,
-    config: Arc<AppConfig>,
+    config: Arc<ArcSwap<AppConfig>>, // 修改类型
     state: Arc<AppState>,
     remote_addr: SocketAddr,
 ) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError> {
-    // 1. 开始计时
     let start = Instant::now();
     let method = req.method().to_string();
     let method_str = method.to_string();
 
-    // 1. 健康检查
     if req.uri().path() == "/health" {
-        let body = Full::new(Bytes::from("OK (Active Health Check)"))
+        let body = Full::new(Bytes::from("OK (Hot Reloading)"))
             .map_err(|e| match e {})
             .boxed();
         return Ok(Response::new(body));
@@ -347,21 +399,22 @@ async fn proxy_handler(
 
     let req_path = req.uri().path().to_string();
 
-    // 2. 路由匹配逻辑 (First Match Wins)
+    // 加载配置快照
+    let current_config = config.load();
+
+    // 1. 路由匹配
     let mut matched_route: Option<&RouteConfig> = None;
-    for route in &config.routes {
+    for route in &current_config.routes {
         if req_path.starts_with(&route.path) {
             matched_route = Some(route);
-            break; // 找到第一个匹配的就停止
+            break;
         }
     }
 
-    // 提取 upstream 名称用于 Label，如果没有匹配则是 "unknown"
     let upstream_name = matched_route
         .map(|r| r.upstream.as_str())
         .unwrap_or("unknown");
 
-    // 3. 处理 404 (如果没有匹配到任何路由)
     let route = match matched_route {
         Some(r) => r,
         None => {
@@ -378,11 +431,16 @@ async fn proxy_handler(
         }
     };
 
-    // 4. 获取健康节点的 Upstream 状态
-    let upstream_state = match state.upstreams.get(&route.upstream) {
+    // 2. 获取 Upstream 状态
+    // 加载状态快照
+    let current_state_map = state.upstreams.load();
+    let upstream_state = match current_state_map.get(&route.upstream) {
         Some(s) => s,
         None => {
-            error!("Upstream '{}' not found in state", route.upstream);
+            error!(
+                "Upstream '{}' not found in state (Config mismatch?)",
+                route.upstream
+            );
             record_metrics(&method, "500", upstream_name, start);
             return Ok(Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -395,7 +453,7 @@ async fn proxy_handler(
         }
     };
 
-    // 5. 获取当前健康的 URL 列表
+    // 3. 获取当前健康的 URL 列表
     let active_urls_guard = upstream_state.active_urls.load();
     let active_urls = &**active_urls_guard;
 
@@ -429,30 +487,8 @@ async fn proxy_handler(
         info!("WebSocket LB -> {}", upstream_url_str);
         return handle_websocket(req, client, upstream_base).await;
     }
-    // ========================================================
 
-    // ================== 判断是否应该缓冲 Body ==================
-    let content_length = req
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-
-    let should_buffer = if let Some(len) = content_length {
-        // 场景 A: 有明确长度，检查是否小于阈值，才缓冲并启用重试
-        len <= MAX_BUFFER_SIZE
-    } else {
-        // 场景 B: 没有 Content-Length
-        // 对于 GET/HEAD 等通常无 Body 的方法，我们应该缓冲 (Body 实际上是空的，开销为 0)
-        // 对于 POST/PUT，如果没有 Length，通常是 Chunked 传输，可能很大，走流式
-        match *req.method() {
-            Method::GET | Method::HEAD | Method::OPTIONS | Method::DELETE => true,
-            _ => false,
-        }
-    };
-
-    // 提前计算 path_query 字符串并持有所有权
-    // 在 req 被消耗前完成
+    // 路径处理
     let path_query = req
         .uri()
         .path_and_query()
@@ -460,12 +496,8 @@ async fn proxy_handler(
         .unwrap_or(&req_path)
         .to_string();
 
-    // 6. 路径重写 (Path Rewriting)
     let final_path = if route.strip_prefix {
-        // 如果开启了 strip_prefix，把路由前缀去掉
-        // 比如：req: /api/v1/get, route: /api/v1 -> new: /get
         if let Some(stripped) = path_query.strip_prefix(&route.path) {
-            // 确保以 / 开头
             if !stripped.starts_with('/') {
                 format!("/{}", stripped)
             } else {
@@ -478,35 +510,47 @@ async fn proxy_handler(
         path_query.clone()
     };
 
-    // 7. 拆解 Request 并缓冲 Body
+    // 判断 Body 缓冲
+    let content_length = req
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+
+    let should_buffer = if let Some(len) = content_length {
+        len <= MAX_BUFFER_SIZE
+    } else {
+        match *req.method() {
+            Method::GET | Method::HEAD | Method::OPTIONS | Method::DELETE => true,
+            _ => false,
+        }
+    };
+
+    // 拆解 Request
     let (parts, body) = req.into_parts();
 
-    // ================== 分支逻辑 ==================
     if should_buffer {
-        // >>> 分支 A: 缓冲模式 (支持重试 + 故障转移) <<<
+        // === 缓冲模式 ===
         let body_bytes = body.collect().await?.to_bytes();
         let body_full = Full::new(body_bytes);
 
-        // 故障转移循环 (代码复用上一版，略微精简注释)
         let max_failover_attempts = active_urls.len();
         let mut last_error: Option<ProxyError> = None;
 
         for attempt in 0..max_failover_attempts {
+            // 注意：循环中要重新获取 active_urls 吗？不需要，我们在请求开始时锁定了快照
+            // 这保证了在一个请求的处理周期内，视图是一致的
+
             let current_count = upstream_state.counter.fetch_add(1, Ordering::Relaxed);
             let index = current_count % active_urls.len();
             let upstream_url_str = &active_urls[index];
 
-            // 构造 URI
             let upstream_base = match upstream_url_str.parse::<Uri>() {
                 Ok(u) => u,
-                Err(_) => continue,
-            };
-            let base_str = upstream_base.to_string();
-            let base_trimmed = base_str.trim_end_matches('/');
-            let uri_string = format!("{}{}", base_trimmed, final_path);
-            let new_uri = match uri_string.parse::<Uri>() {
-                Ok(u) => u,
-                Err(_) => continue,
+                Err(e) => {
+                    error!("Invalid upstream: {}", e);
+                    continue;
+                }
             };
 
             info!(
@@ -516,7 +560,14 @@ async fn proxy_handler(
                 upstream_url_str
             );
 
-            // 构造请求
+            let base_str = upstream_base.to_string();
+            let base_trimmed = base_str.trim_end_matches('/');
+            let uri_string = format!("{}{}", base_trimmed, final_path);
+            let new_uri = match uri_string.parse::<Uri>() {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+
             let mut builder = Request::builder()
                 .method(parts.method.clone())
                 .uri(new_uri)
@@ -534,7 +585,6 @@ async fn proxy_handler(
                 Err(_) => continue,
             };
 
-            // 使用 Tower Retry
             let retry_service = ServiceBuilder::new()
                 .layer(tower::retry::RetryLayer::new(ProxyRetryPolicy::new(3)))
                 .service(service_fn(|req: Request<Full<Bytes>>| {
@@ -542,7 +592,8 @@ async fn proxy_handler(
                     async move {
                         let (parts, body) = req.into_parts();
                         let boxed_body = body.map_err(|e| match e {}).boxed();
-                        client.request(Request::from_parts(parts, boxed_body)).await
+                        let new_req = Request::from_parts(parts, boxed_body);
+                        client.request(new_req).await
                     }
                 }));
 
@@ -550,7 +601,9 @@ async fn proxy_handler(
                 Ok(res) => {
                     let status = res.status().as_u16().to_string();
                     record_metrics(&method_str, &status, upstream_name, start);
-                    return Ok(res.map(|b| b.map_err(|e| Box::new(e) as ProxyError).boxed()));
+                    let res_boxed =
+                        res.map(|b: Incoming| b.map_err(|e| Box::new(e) as ProxyError).boxed());
+                    return Ok(res_boxed);
                 }
                 Err(err) => {
                     warn!(
@@ -562,21 +615,17 @@ async fn proxy_handler(
             }
         }
 
-        // 循环结束仍失败
         error!("All upstreams failed. Last: {:?}", last_error);
         record_metrics(&method_str, "502", upstream_name, start);
-        return Ok(Response::builder()
+        Ok(Response::builder()
             .status(502)
             .body(Empty::new().map_err(|e| match e {}).boxed())
-            .unwrap());
+            .unwrap())
     } else {
-        // >>> 分支 B: 流式模式 (无重试，低内存) <<<
-
-        // 1. 选址 (只选一次，不支持故障转移，因为 body 流不能倒带)
+        // === 流式模式 ===
         let current_count = upstream_state.counter.fetch_add(1, Ordering::Relaxed);
         let index = current_count % active_urls.len();
         let upstream_url_str = &active_urls[index];
-
         let upstream_base = match upstream_url_str.parse::<Uri>() {
             Ok(u) => u,
             Err(_) => {
@@ -587,7 +636,8 @@ async fn proxy_handler(
             }
         };
 
-        // URL 拼接
+        info!("Streaming to {} (No Retry)", upstream_url_str);
+
         let base_str = upstream_base.to_string();
         let base_trimmed = base_str.trim_end_matches('/');
         let uri_string = format!("{}{}", base_trimmed, final_path);
@@ -601,15 +651,10 @@ async fn proxy_handler(
             }
         };
 
-        info!("Streaming Large Request to {} (No Retry)", upstream_url_str);
-
-        // 2. 构造请求
         let mut builder = Request::builder()
-            .method(parts.method) // 直接 move parts，不需要 clone
+            .method(parts.method)
             .uri(new_uri)
             .version(parts.version);
-
-        // 使用 parts.headers
         for (k, v) in &parts.headers {
             builder = builder.header(k, v);
         }
@@ -618,7 +663,6 @@ async fn proxy_handler(
         }
         builder = builder.header("x-forwarded-for", remote_addr.ip().to_string());
 
-        // 直接使用原始的流式 body
         let streaming_req = match builder.body(body.map_err(|e| Box::new(e) as ProxyError).boxed())
         {
             Ok(r) => r,
@@ -630,7 +674,6 @@ async fn proxy_handler(
             }
         };
 
-        // 3. 直接发送 (不经过 RetryLayer)
         match client.request(streaming_req).await {
             Ok(res) => {
                 let status = res.status().as_u16().to_string();
@@ -638,7 +681,7 @@ async fn proxy_handler(
                 Ok(res.map(|b| b.map_err(|e| Box::new(e) as ProxyError).boxed()))
             }
             Err(err) => {
-                error!("Streaming request failed: {:?}", err);
+                error!("Streaming failed: {:?}", err);
                 record_metrics(&method_str, "502", upstream_name, start);
                 Ok(Response::builder()
                     .status(502)
@@ -649,7 +692,6 @@ async fn proxy_handler(
     }
 }
 
-// === 辅助函数：统一记录指标 ===
 fn record_metrics(method: &str, status: &str, upstream: &str, start: Instant) {
     let duration = start.elapsed().as_secs_f64();
 
@@ -672,62 +714,36 @@ fn record_metrics(method: &str, status: &str, upstream: &str, start: Instant) {
     .record(duration);
 }
 
-// 在 main 函数初始化阶段执行一次
 fn init_metrics() {
-    describe_counter!(
-        "http_requests_total",
-        "The total number of HTTP requests handled by the proxy."
-    );
-
-    describe_histogram!(
-        "http_request_duration_seconds",
-        "The response latency distribution in seconds."
-    );
-
-    describe_gauge!(
-        "active_connections",
-        "Current number of active TCP connections."
-    );
+    describe_counter!("http_requests_total", "Total requests");
+    describe_histogram!("http_request_duration_seconds", "Request latency");
+    describe_gauge!("active_connections", "Active connections");
 }
 
-/// 加载证书
 fn load_certs(filename: &str) -> Result<Vec<CertificateDer<'static>>, ProxyError> {
     let file =
         File::open(filename).map_err(|e| error(format!("failed to open cert file: {}", e)))?;
     let mut reader = BufReader::new(file);
-    // rustls-pemfile 2.0 写法
     let certs = rustls_pemfile::certs(&mut reader)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| error(format!("failed to load certs: {}", e)))?;
     Ok(certs)
 }
 
-/// 加载私钥
 fn load_private_key(filename: &str) -> Result<PrivateKeyDer<'static>, ProxyError> {
     let file =
         File::open(filename).map_err(|e| error(format!("failed to open key file: {}", e)))?;
     let mut reader = BufReader::new(file);
-    // 尝试读取私钥 (支持 pkcs8, rsa, sec1 等多种格式)
     rustls_pemfile::private_key(&mut reader)
         .map_err(|e| error(format!("failed to load private key: {}", e)))?
         .ok_or_else(|| error("no private key found".to_string()))
 }
 
-// 简单的错误转换辅助
 fn error<T: Into<String>>(msg: T) -> ProxyError {
     Box::new(std::io::Error::new(std::io::ErrorKind::Other, msg.into()))
 }
 
-// 错误映射函数
 fn map_tower_error_to_response(err: BoxError) -> Response<BoxBody<Bytes, ProxyError>> {
-    if err.is::<tower::timeout::error::Elapsed>() {
-        let body = Full::new(Bytes::from("Gateway Timeout"))
-            .map_err(|e| match e {})
-            .boxed();
-        let mut resp = Response::new(body);
-        *resp.status_mut() = StatusCode::GATEWAY_TIMEOUT;
-        return resp;
-    }
     error!("Tower error: {:?}", err);
     let body = Full::new(Bytes::from("Bad Gateway"))
         .map_err(|e| match e {})
@@ -743,102 +759,60 @@ async fn handle_websocket(
     upstream_base: Uri,
 ) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError> {
     info!("Detected WebSocket upgrade request");
-
-    // 1. 构造发往上游的请求
-    // 我们需要手动要把 req 的 header 复制到一个新的 Request 中
-    // 因为原本的 req 需要保留下来，用于后续的 upgrade::on(req) 获取客户端 IO
     let path = req.uri().path();
     let path_query = req
         .uri()
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or(path);
-
     let base_str = upstream_base.to_string();
     let base_trimmed = base_str.trim_end_matches('/');
     let uri_string = format!("{}{}", base_trimmed, path_query);
     let new_uri = uri_string.parse::<Uri>()?;
-
     let mut upstream_req_builder = Request::builder()
         .method(req.method())
         .uri(new_uri)
         .version(req.version());
-
-    // 复制 Header
     for (k, v) in req.headers() {
         upstream_req_builder = upstream_req_builder.header(k, v);
     }
-
-    // 强制设置 Host (如果上游需要 SNI)
     if let Some(host) = upstream_base.host() {
         upstream_req_builder = upstream_req_builder.header("Host", host);
     }
-
-    // WebSocket 握手请求通常没有 Body，或者 Body 为空
     let upstream_req =
         upstream_req_builder.body(Empty::<Bytes>::new().map_err(|e| match e {}).boxed())?;
-
-    // 2. 发送请求给上游
     let res = client.request(upstream_req).await?;
-
-    // 3. 检查上游是否同意升级 (Status 101)
     if res.status() == StatusCode::SWITCHING_PROTOCOLS {
         info!("Upstream accepted WebSocket upgrade (101)");
-
-        // 4. 构造返回给客户端的 101 响应
         let mut client_res_builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
-
-        // 复制上游返回的 Upgrade 相关 Header 给客户端
         for (k, v) in res.headers() {
             client_res_builder = client_res_builder.header(k, v);
         }
-
         let client_res =
             client_res_builder.body(Empty::<Bytes>::new().map_err(|e| match e {}).boxed())?;
-
-        // 5. 【核心黑魔法】开启后台任务，进行双向隧道传输
         tokio::spawn(async move {
-            // A. 获取客户端的底层 IO (Upgrade Future)
             let upgraded_client = match hyper::upgrade::on(req).await {
-                Ok(upgraded) => upgraded,
+                Ok(u) => u,
                 Err(e) => {
-                    error!("Client upgrade error: {}", e);
+                    error!("Client error: {}", e);
                     return;
                 }
             };
-
-            // B. 获取上游的底层 IO (Upgrade Future)
             let upgraded_upstream = match hyper::upgrade::on(res).await {
-                Ok(upgraded) => upgraded,
+                Ok(u) => u,
                 Err(e) => {
-                    error!("Upstream upgrade error: {}", e);
+                    error!("Upstream error: {}", e);
                     return;
                 }
             };
-
-            // C. 转换为 Tokio 兼容的 IO (Hyper 1.0 的 IO 是实现了 hyper::rt::Io 的，tokio 需要 AsyncRead/Write)
             let mut client_io = TokioIo::new(upgraded_client);
             let mut upstream_io = TokioIo::new(upgraded_upstream);
-
-            // D. 建立双向管道，直到一方断开
-            info!("WebSocket tunnel established");
-            match copy_bidirectional(&mut client_io, &mut upstream_io).await {
-                Ok((from_client, from_server)) => {
-                    info!(
-                        "WebSocket tunnel closed. Client sent: {} bytes, Server sent: {} bytes",
-                        from_client, from_server
-                    );
-                }
-                Err(e) => {
-                    error!("WebSocket tunnel error: {}", e);
-                }
+            if let Err(e) = copy_bidirectional(&mut client_io, &mut upstream_io).await {
+                error!("Tunnel error: {}", e);
             }
         });
-
-        // 立即返回 101 响应给客户端，触发客户端的 Upgrade 逻辑
         Ok(client_res)
     } else {
-        // 如果上游拒绝升级 (比如返回 403)，则当作普通 HTTP 请求处理，直接透传响应
         info!("Upstream rejected upgrade: {}", res.status());
         Ok(res.map(|b| b.map_err(|e| Box::new(e) as ProxyError).boxed()))
     }
@@ -873,25 +847,25 @@ impl Drop for ConnectionGuard {
     }
 }
 
-// 配置结构体
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct AppConfig {
     server: ServerConfig,
     upstreams: HashMap<String, UpstreamConfig>,
     routes: Vec<RouteConfig>,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct ServerConfig {
     listen_addr: String,
     cert_file: String,
     key_file: String,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct UpstreamConfig {
     urls: Vec<String>,
     // counter 移到了 UpstreamState
 }
-#[derive(Debug, Deserialize)]
+
+#[derive(Debug, Deserialize, Clone)]
 struct RouteConfig {
     path: String,
     upstream: String,
@@ -907,25 +881,19 @@ struct Cli {
 
 #[derive(Clone)]
 struct ProxyRetryPolicy {
-    /// 最大重试次数
     max_attempts: usize,
 }
-
 impl ProxyRetryPolicy {
     fn new(max_attempts: usize) -> Self {
         Self { max_attempts }
     }
 }
-
-// 不再使用泛型 Res，直接指定为 Response<Incoming>
-// E 依然泛型，只要能转成 BoxError 即可
 impl<B, E> Policy<Request<B>, Response<Incoming>, E> for ProxyRetryPolicy
 where
     B: Clone,
     E: Into<BoxError>,
 {
     type Future = future::Ready<()>;
-
     fn retry(
         &mut self,
         _req: &mut Request<B>,
