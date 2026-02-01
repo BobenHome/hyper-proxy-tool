@@ -5,6 +5,12 @@ listen_addr = "0.0.0.0:8443"
 cert_file = "cert.pem"
 key_file = "key.pem"
 
+# === 新增：IP 限流配置 ===
+# 每个 IP 每秒允许 10 次请求，突发（Burst）允许 20 次
+[server.ip_limit]
+requests_per_second = 10
+burst = 20
+
 # 定义上游服务池 (Map结构: name -> details)
 [upstreams]
 [upstreams.httpbin_cluster]
@@ -24,6 +30,10 @@ urls = ["http://127.0.0.1:9001"]
 path = "/api/v1"
 upstream = "httpbin_cluster"
 strip_prefix = true
+# 该路由每秒总共允许 50 次请求
+[routes.limit]
+requests_per_second = 1
+burst = 100
 
 [[routes]]
 path = "/ws"

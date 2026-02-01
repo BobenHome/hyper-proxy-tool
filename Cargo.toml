@@ -37,3 +37,5 @@ metrics-exporter-prometheus = "0.18"
 arc-swap = "1.8"
 notify = "8"
 tokio-util = "0.7"
+
+governor = "0.10"

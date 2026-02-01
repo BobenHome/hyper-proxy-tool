@@ -1,6 +1,9 @@
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use clap::Parser;
+use governor::clock::DefaultClock;
+use governor::state::{InMemoryState, NotKeyed, keyed};
+use governor::{Quota, RateLimiter};
 use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::header::CONTENT_LENGTH;
@@ -21,7 +24,8 @@ use std::fs;
 use std::fs::File;
 use std::future;
 use std::io::BufReader;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -39,11 +43,17 @@ use tracing::{error, info, instrument, warn};
 
 // 定义通用错误
 type ProxyError = Box<dyn std::error::Error + Send + Sync + 'static>;
-
-// 修改 Client 类型
 type HttpClient = Client<HttpsConnector<HttpConnector>, BoxBody<Bytes, ProxyError>>;
 
 const MAX_BUFFER_SIZE: u64 = 64 * 1024;
+
+// ================== 限流器定义 ==================
+// 1. IP 限流器：带 Key (IpAddr)
+type IpRateLimiter = RateLimiter<IpAddr, keyed::DefaultKeyedStateStore<IpAddr>, DefaultClock>;
+// 2. 路由限流器：不带 Key (全局计数)
+type RouteRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
+
+// ================== 动态状态管理 ==================
 
 struct UpstreamState {
     active_urls: ArcSwap<Vec<String>>,
@@ -51,8 +61,15 @@ struct UpstreamState {
 }
 
 struct AppState {
+    // 上游状态
     upstreams: ArcSwap<HashMap<String, Arc<UpstreamState>>>,
+    // 全局 IP 限流器 (Option 因为配置可能没开)
+    ip_limiter: ArcSwap<Option<Arc<IpRateLimiter>>>,
+    // 路由限流器映射: Route Path -> Limiter
+    route_limiters: ArcSwap<HashMap<String, Arc<RouteRateLimiter>>>,
 }
+
+// ===============================================
 
 #[tokio::main]
 async fn main() -> Result<(), ProxyError> {
@@ -60,19 +77,14 @@ async fn main() -> Result<(), ProxyError> {
         .with_env_filter("hyper_proxy_tool=info")
         .init();
 
-    // 监听 0.0.0.0:9000，提供 /metrics 接口
-    // 这启动了一个后台 Future，不阻塞主线程
+    // 1. Prometheus 初始化
     let builder = PrometheusBuilder::new();
     builder
         .with_http_listener(([0, 0, 0, 0], 9000))
         .install()
         .expect("failed to install Prometheus recorder");
-
-    info!("Metrics endpoint exposed at http://0.0.0.0:9000/metrics");
-    // ============================================================
-
-    // 指标自描述
     init_metrics();
+    info!("Metrics endpoint exposed at http://0.0.0.0:9000/metrics");
 
     // 2. 初始加载配置
     let args = Cli::parse();
@@ -80,12 +92,14 @@ async fn main() -> Result<(), ProxyError> {
     let initial_config = load_config(&config_path)?;
 
     // 3. 初始化全局状态
-    // 将 Config 和 State 都放入 ArcSwap，以便原子替换
-    let (initial_state_map, _) = create_state_from_config(&initial_config);
+    let (initial_upstreams, initial_ip_limiter, initial_route_limiters) =
+        create_state_from_config(&initial_config);
 
     let app_config = Arc::new(ArcSwap::from_pointee(initial_config));
     let app_state = Arc::new(AppState {
-        upstreams: ArcSwap::new(Arc::new(initial_state_map)),
+        upstreams: ArcSwap::new(Arc::new(initial_upstreams)),
+        ip_limiter: ArcSwap::new(Arc::new(initial_ip_limiter)),
+        route_limiters: ArcSwap::new(Arc::new(initial_route_limiters)),
     });
 
     // 4. 初始化 Client
@@ -113,7 +127,6 @@ async fn main() -> Result<(), ProxyError> {
     // ================== 配置热加载与健康检查管理 ==================
     let (tx, mut rx) = mpsc::channel(1);
 
-    // 启动文件监听器
     let mut watcher = RecommendedWatcher::new(
         move |res| {
             let _ = tx.blocking_send(res);
@@ -129,7 +142,6 @@ async fn main() -> Result<(), ProxyError> {
     let config_file_path = config_path.clone();
 
     tokio::spawn(async move {
-        // 1. 启动初始的健康检查任务
         let mut cancel_token = CancellationToken::new();
         let mut health_handle = tokio::spawn(start_health_check_loop(
             manager_config.clone(),
@@ -140,36 +152,35 @@ async fn main() -> Result<(), ProxyError> {
 
         info!("Configuration watcher started for: {}", config_file_path);
 
-        // 2. 循环等待文件变更事件
         while let Some(res) = rx.recv().await {
             match res {
                 Ok(event) => {
                     if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
                         info!("Config file changed, reloading...");
-                        // 稍微延迟，防止文件写入未完成
                         tokio::time::sleep(Duration::from_millis(100)).await;
 
                         match load_config(&config_file_path) {
                             Ok(new_conf) => {
                                 info!("Config reloaded successfully!");
 
-                                // 更新 Config (原子替换)
+                                // A. 更新 Config
                                 manager_config.store(Arc::new(new_conf.clone()));
 
-                                // 更新 State
-                                let (new_state_map, _) = create_state_from_config(&new_conf);
-                                manager_state.upstreams.store(Arc::new(new_state_map));
+                                // B. 更新 State (包括 Upstreams 和 Limiters)
+                                let (new_upstreams, new_ip_limiter, new_route_limiters) =
+                                    create_state_from_config(&new_conf);
 
-                                // 重启健康检查任务
+                                manager_state.upstreams.store(Arc::new(new_upstreams));
+                                manager_state.ip_limiter.store(Arc::new(new_ip_limiter));
+                                manager_state
+                                    .route_limiters
+                                    .store(Arc::new(new_route_limiters));
 
-                                // 1. 发送取消信号给旧任务
+                                // C. 重启健康检查
                                 cancel_token.cancel();
-
-                                // 2. 等待旧任务彻底结束
                                 let _ = health_handle.await;
                                 info!("Old health check task stopped.");
 
-                                // 3. 启动新任务
                                 info!("Starting new health check task...");
                                 cancel_token = CancellationToken::new();
                                 health_handle = tokio::spawn(start_health_check_loop(
@@ -286,7 +297,15 @@ fn load_config(path: &str) -> Result<AppConfig, ProxyError> {
     Ok(config)
 }
 
-fn create_state_from_config(config: &AppConfig) -> (HashMap<String, Arc<UpstreamState>>, ()) {
+// 修改：返回 Upstreams, IP Limiter, Route Limiters
+fn create_state_from_config(
+    config: &AppConfig,
+) -> (
+    HashMap<String, Arc<UpstreamState>>,
+    Option<Arc<IpRateLimiter>>,
+    HashMap<String, Arc<RouteRateLimiter>>,
+) {
+    // 1. Upstreams
     let mut upstreams_state = HashMap::new();
     for (name, u_conf) in &config.upstreams {
         upstreams_state.insert(
@@ -297,7 +316,33 @@ fn create_state_from_config(config: &AppConfig) -> (HashMap<String, Arc<Upstream
             }),
         );
     }
-    (upstreams_state, ())
+
+    // 2. IP Limiter
+    let ip_limiter = if let Some(limit_conf) = &config.server.ip_limit {
+        if let Some(rps) = NonZeroU32::new(limit_conf.requests_per_second) {
+            let burst = NonZeroU32::new(limit_conf.burst).unwrap_or(rps);
+            let quota = Quota::per_second(rps).allow_burst(burst);
+            Some(Arc::new(RateLimiter::keyed(quota)))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // 3. Route Limiters
+    let mut route_limiters = HashMap::new();
+    for route in &config.routes {
+        if let Some(limit_conf) = &route.limit {
+            if let Some(rps) = NonZeroU32::new(limit_conf.requests_per_second) {
+                let burst = NonZeroU32::new(limit_conf.burst).unwrap_or(rps);
+                let quota = Quota::per_second(rps).allow_burst(burst);
+                route_limiters.insert(route.path.clone(), Arc::new(RateLimiter::direct(quota)));
+            }
+        }
+    }
+
+    (upstreams_state, ip_limiter, route_limiters)
 }
 
 // ================== 健康检查逻辑 (支持取消) ==================
@@ -382,7 +427,7 @@ async fn check_upstream(client: &HttpClient, url: &str) -> bool {
 async fn proxy_handler(
     req: Request<Incoming>,
     client: Arc<HttpClient>,
-    config: Arc<ArcSwap<AppConfig>>, // 修改类型
+    config: Arc<ArcSwap<AppConfig>>,
     state: Arc<AppState>,
     remote_addr: SocketAddr,
 ) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError> {
@@ -391,10 +436,26 @@ async fn proxy_handler(
     let method_str = method.to_string();
 
     if req.uri().path() == "/health" {
-        let body = Full::new(Bytes::from("OK (Hot Reloading)"))
+        let body = Full::new(Bytes::from("OK (Rate Limited)"))
             .map_err(|e| match e {})
             .boxed();
         return Ok(Response::new(body));
+    }
+
+    // ================== 1. 防御层：IP 限流 ==================
+    if let Some(limiter) = &**state.ip_limiter.load() {
+        if let Err(_) = limiter.check_key(&remote_addr.ip()) {
+            warn!("IP Rate Limit Exceeded: {}", remote_addr.ip());
+            record_metrics(&method_str, "429", "ip_limit", start);
+            return Ok(Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .body(
+                    Full::new(Bytes::from("429 Too Many Requests (IP)"))
+                        .map_err(|e| match e {})
+                        .boxed(),
+                )
+                .unwrap());
+        }
     }
 
     let req_path = req.uri().path().to_string();
@@ -402,7 +463,7 @@ async fn proxy_handler(
     // 加载配置快照
     let current_config = config.load();
 
-    // 1. 路由匹配
+    // 2. 路由匹配
     let mut matched_route: Option<&RouteConfig> = None;
     for route in &current_config.routes {
         if req_path.starts_with(&route.path) {
@@ -431,7 +492,24 @@ async fn proxy_handler(
         }
     };
 
-    // 2. 获取 Upstream 状态
+    // ================== 3. 防御层：路由限流 ==================
+    let route_limiters = state.route_limiters.load();
+    if let Some(limiter) = route_limiters.get(&route.path) {
+        if let Err(_) = limiter.check() {
+            warn!("Route Rate Limit Exceeded: {}", route.path);
+            record_metrics(&method_str, "429", "route_limit", start);
+            return Ok(Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .body(
+                    Full::new(Bytes::from("429 Too Many Requests (Route)"))
+                        .map_err(|e| match e {})
+                        .boxed(),
+                )
+                .unwrap());
+        }
+    }
+
+    // 4. 获取 Upstream 状态
     // 加载状态快照
     let current_state_map = state.upstreams.load();
     let upstream_state = match current_state_map.get(&route.upstream) {
@@ -453,7 +531,7 @@ async fn proxy_handler(
         }
     };
 
-    // 3. 获取当前健康的 URL 列表
+    // 5. 获取当前健康的 URL 列表
     let active_urls_guard = upstream_state.active_urls.load();
     let active_urls = &**active_urls_guard;
 
@@ -538,9 +616,6 @@ async fn proxy_handler(
         let mut last_error: Option<ProxyError> = None;
 
         for attempt in 0..max_failover_attempts {
-            // 注意：循环中要重新获取 active_urls 吗？不需要，我们在请求开始时锁定了快照
-            // 这保证了在一个请求的处理周期内，视图是一致的
-
             let current_count = upstream_state.counter.fetch_add(1, Ordering::Relaxed);
             let index = current_count % active_urls.len();
             let upstream_url_str = &active_urls[index];
@@ -692,10 +767,10 @@ async fn proxy_handler(
     }
 }
 
+// === 辅助函数 & 结构体定义 ===
+
 fn record_metrics(method: &str, status: &str, upstream: &str, start: Instant) {
     let duration = start.elapsed().as_secs_f64();
-
-    // 1. 计数器：http_requests_total
     counter!(
         "http_requests_total",
         "method" => method.to_string(),
@@ -703,8 +778,6 @@ fn record_metrics(method: &str, status: &str, upstream: &str, start: Instant) {
         "upstream" => upstream.to_string()
     )
     .increment(1);
-
-    // 2. 直方图：http_request_duration_seconds
     histogram!(
         "http_request_duration_seconds",
         "method" => method.to_string(),
@@ -847,6 +920,8 @@ impl Drop for ConnectionGuard {
     }
 }
 
+// === 结构体定义 ===
+
 #[derive(Debug, Deserialize, Clone)]
 struct AppConfig {
     server: ServerConfig,
@@ -858,20 +933,26 @@ struct ServerConfig {
     listen_addr: String,
     cert_file: String,
     key_file: String,
+    ip_limit: Option<RateLimitConfig>, // 新增
 }
 #[derive(Debug, Deserialize, Clone)]
 struct UpstreamConfig {
     urls: Vec<String>,
-    // counter 移到了 UpstreamState
 }
-
 #[derive(Debug, Deserialize, Clone)]
 struct RouteConfig {
     path: String,
     upstream: String,
     #[serde(default)]
     strip_prefix: bool,
+    limit: Option<RateLimitConfig>, // 新增
 }
+#[derive(Debug, Deserialize, Clone)]
+struct RateLimitConfig {
+    requests_per_second: u32,
+    burst: u32,
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -902,13 +983,10 @@ where
         if self.max_attempts == 0 {
             return None;
         }
-
         let should_retry = match result {
-            // 直接使用 res，不需要 as_ref()
             Ok(res) => res.status().is_server_error(),
             Err(_) => true,
         };
-
         if should_retry {
             self.max_attempts -= 1;
             Some(future::ready(()))
@@ -916,17 +994,14 @@ where
             None
         }
     }
-
     fn clone_request(&mut self, req: &Request<B>) -> Option<Request<B>> {
         let mut builder = Request::builder()
             .method(req.method())
             .uri(req.uri())
             .version(req.version());
-
         for (k, v) in req.headers() {
             builder = builder.header(k, v);
         }
-
         builder.body(req.body().clone()).ok()
     }
 }
