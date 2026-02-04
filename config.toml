@@ -11,6 +11,12 @@ key_file = "key.pem"
 requests_per_second = 10
 burst = 20
 
+# === 新增：Tracing 配置 ===
+[server.tracing]
+enabled = true
+# Jaeger 的 OTLP gRPC 端口通常是 4317
+endpoint = "http://localhost:4317"
+
 # 定义上游服务池 (Map结构: name -> details)
 [upstreams]
 [upstreams.httpbin_cluster]

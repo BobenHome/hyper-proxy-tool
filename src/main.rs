@@ -16,6 +16,13 @@ use hyper_util::service::TowerToHyperService;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use opentelemetry::trace::TracerProvider; // 这是 Trait，用于调用 .tracer()
+use opentelemetry::{KeyValue, global};
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::trace::SdkTracerProvider;
+use opentelemetry_sdk::{propagation::TraceContextPropagator, resource::Resource};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -40,6 +47,7 @@ use tower::service_fn;
 use tower::{BoxError, ServiceBuilder, ServiceExt};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, instrument, warn};
+use tracing_subscriber::{Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
 // 定义通用错误
 type ProxyError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -69,13 +77,39 @@ struct AppState {
     route_limiters: ArcSwap<HashMap<String, Arc<RouteRateLimiter>>>,
 }
 
+use hyper::header::HeaderName;
+use opentelemetry::propagation::Injector;
+
+struct HeaderInjector<'a>(&'a mut hyper::HeaderMap);
+
+impl<'a> Injector for HeaderInjector<'a> {
+    fn set(&mut self, key: &str, value: String) {
+        if let Ok(name) = HeaderName::from_bytes(key.as_bytes()) {
+            if let Ok(val) = hyper::header::HeaderValue::from_str(&value) {
+                self.0.insert(name, val);
+            }
+        }
+    }
+}
+
 // ===============================================
 
 #[tokio::main]
 async fn main() -> Result<(), ProxyError> {
-    tracing_subscriber::fmt()
-        .with_env_filter("hyper_proxy_tool=info")
-        .init();
+    // 1. 加载配置 (为了获取 Tracing 配置)
+    let args = Cli::parse();
+    let config_path = args.config.clone();
+
+    // 这里先简单的读一下配置，不处理错误，如果失败后面还会报错
+    let initial_config_str = fs::read_to_string(&config_path).unwrap_or_default();
+    let initial_config: Option<AppConfig> = toml::from_str(&initial_config_str).ok();
+
+    // 2. 初始化 Tracing (控制台 + Jaeger)
+    if let Some(cfg) = &initial_config {
+        init_tracer(&cfg.server.tracing);
+    } else {
+        init_default_logger();
+    }
 
     // 1. Prometheus 初始化
     let builder = PrometheusBuilder::new();
@@ -87,9 +121,9 @@ async fn main() -> Result<(), ProxyError> {
     info!("Metrics endpoint exposed at http://0.0.0.0:9000/metrics");
 
     // 2. 初始加载配置
-    let args = Cli::parse();
-    let config_path = args.config.clone();
+    // 重新正式加载配置
     let initial_config = load_config(&config_path)?;
+    info!("Config loaded: {:?}", initial_config);
 
     // 3. 初始化全局状态
     let (initial_upstreams, initial_ip_limiter, initial_route_limiters) =
@@ -285,6 +319,74 @@ async fn main() -> Result<(), ProxyError> {
             }
         });
     }
+}
+
+fn init_tracer(config: &Option<TracingConfig>) {
+    // 1. 设置全局 Propagator (W3C Trace Context)
+    global::set_text_map_propagator(TraceContextPropagator::new());
+
+    if let Some(conf) = config {
+        if !conf.enabled {
+            init_default_logger();
+            return;
+        }
+
+        // 2. 创建 OTLP Exporter
+        // 新版写法：使用 SpanExporter::builder()
+        // 需要 use opentelemetry_otlp::WithExportConfig;
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(&conf.endpoint)
+            .build()
+            .expect("Failed to create OTLP exporter");
+
+        // 3. 定义 Resource
+        // 必须使用 Resource::builder()
+        let resource = Resource::builder()
+            .with_service_name("hyper-proxy-tool") // 快捷方法设置服务名
+            .with_attribute(KeyValue::new("service.version", "0.1.0")) // 添加其他属性
+            .build();
+
+        // 4. 创建 SdkTracerProvider
+        let provider = SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_resource(resource)
+            .build();
+
+        // 5. 获取 Tracer 并设置全局 Provider
+        // 注意：provider 需要设置到 global，防止被 Drop
+        let tracer = provider.tracer("hyper-proxy-tool");
+        global::set_tracer_provider(provider);
+
+        // 6. 组合 Layer
+        let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
+
+        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "hyper_proxy_tool=info".into());
+
+        let fmt_layer = tracing_subscriber::fmt::layer();
+
+        Registry::default()
+            .with(env_filter)
+            .with(fmt_layer)
+            .with(telemetry)
+            .init();
+
+        info!(
+            "🔭 Distributed Tracing enabled. Sending to {}",
+            conf.endpoint
+        );
+    } else {
+        init_default_logger();
+    }
+}
+
+fn init_default_logger() {
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "hyper_proxy_tool=info".into());
+    let fmt_layer = tracing_subscriber::fmt::layer();
+
+    Registry::default().with(env_filter).with(fmt_layer).init();
 }
 
 // ================== 辅助逻辑：配置加载与状态创建 ==================
@@ -655,6 +757,16 @@ async fn proxy_handler(
             }
             builder = builder.header("x-forwarded-for", remote_addr.ip().to_string());
 
+            // ================== Tracing 注入 ==================
+            // 将当前的 TraceID 注入到发给上游的 Header 中
+            let ctx = tracing::Span::current().context();
+            if let Some(headers) = builder.headers_mut() {
+                global::get_text_map_propagator(|propagator| {
+                    propagator.inject_context(&ctx, &mut HeaderInjector(headers))
+                });
+            }
+            // =================================================
+
             let retry_req = match builder.body(body_full.clone()) {
                 Ok(r) => r,
                 Err(_) => continue,
@@ -737,6 +849,13 @@ async fn proxy_handler(
             builder = builder.header("Host", host);
         }
         builder = builder.header("x-forwarded-for", remote_addr.ip().to_string());
+
+        let ctx = tracing::Span::current().context();
+        if let Some(headers) = builder.headers_mut() {
+            global::get_text_map_propagator(|propagator| {
+                propagator.inject_context(&ctx, &mut HeaderInjector(headers))
+            });
+        }
 
         let streaming_req = match builder.body(body.map_err(|e| Box::new(e) as ProxyError).boxed())
         {
@@ -934,7 +1053,16 @@ struct ServerConfig {
     cert_file: String,
     key_file: String,
     ip_limit: Option<RateLimitConfig>, // 新增
+    // 新增
+    tracing: Option<TracingConfig>,
 }
+
+#[derive(Debug, Deserialize, Clone)]
+struct TracingConfig {
+    enabled: bool,
+    endpoint: String,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 struct UpstreamConfig {
     urls: Vec<String>,

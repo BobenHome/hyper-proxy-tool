@@ -1,0 +1,10 @@
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: jaeger
+    ports:
+      - "16686:16686" # Web UI 面板
+      - "4317:4317" # OTLP gRPC 接收端口 (Rust 程序发数据到这里)
+      - "4318:4318" # OTLP HTTP 接收端口
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
