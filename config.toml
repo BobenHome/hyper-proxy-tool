@@ -1,9 +1,18 @@
 # config.toml
 
 [server]
-listen_addr = "0.0.0.0:8443"
+listen_addr = "0.0.0.0:443" # ACME 生产环境必须监听 443
+# 如果开启 ACME，下面两个文件路径将被忽略，但建议保留作为本地回退
 cert_file = "cert.pem"
 key_file = "key.pem"
+
+# === 新增：ACME 配置 ===
+[server.acme]
+enabled = true                 # 开关
+domain = "47.100.136.50.sslip.io" # 真实域名
+email = "1539490741@qq.com"    # 用于接收过期通知
+production = false             # false=使用测试环境(Staging), true=正式环境
+cache_dir = ".acme_cache"      # 证书缓存目录
 
 # === 新增：IP 限流配置 ===
 # 每个 IP 每秒允许 10 次请求，突发（Burst）允许 20 次

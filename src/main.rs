@@ -49,6 +49,10 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, instrument, warn};
 use tracing_subscriber::{Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
+use rustls_acme::acme::ACME_TLS_ALPN_NAME;
+use rustls_acme::{AcmeConfig as RustlsAcmeConfig, caches::DirCache};
+use tokio_stream::StreamExt; // 用于处理 ACME 事件流
+
 // 定义通用错误
 type ProxyError = Box<dyn std::error::Error + Send + Sync + 'static>;
 type HttpClient = Client<HttpsConnector<HttpConnector>, BoxBody<Bytes, ProxyError>>;
@@ -137,15 +141,54 @@ async fn main() -> Result<(), ProxyError> {
     });
 
     // 4. 初始化 Client
-    let current_conf = app_config.load();
-    let certs = load_certs(&current_conf.server.cert_file)?;
-    let key = load_private_key(&current_conf.server.key_file)?;
+    // 1. 获取配置快照 (Guard)
+    let current_config = app_config.load();
 
-    let mut server_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| error(format!("{}", e)))?;
-    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    // ================== TLS 配置==================
+    let server_config = if let Some(acme) = &current_config.server.acme {
+        if acme.enabled {
+            info!("🔒 ACME enabled. Domain: {}", acme.domain);
+            // 我们需要 Clone 出拥有所有权的数据，以满足 'static 要求
+            let cache_dir = acme.cache_dir.clone();
+            // 1. 配置 ACME
+            // 注意：这里需要 mut，因为下面要遍历它
+            let mut acme_state = RustlsAcmeConfig::new(vec![acme.domain.clone()])
+                .contact(vec![format!("mailto:{}", acme.email)])
+                .cache(DirCache::new(cache_dir))
+                .directory_lets_encrypt(acme.production)
+                .state(); // 这里返回的 AcmeState 本身就是 Stream
+
+            // 2. 获取 Resolver (必须在 move 进 spawn 之前获取)
+            let resolver = acme_state.resolver();
+
+            // 3. 启动 ACME 后台驱动 (直接遍历 acme_state)
+            tokio::spawn(async move {
+                while let Some(event) = acme_state.next().await {
+                    match event {
+                        Ok(ok) => info!("ACME event: {:?}", ok),
+                        Err(err) => error!("ACME error: {:?}", err),
+                    }
+                }
+            });
+
+            // 4. 构建动态 ServerConfig
+            let mut cfg = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(resolver); // 使用上面获取的 resolver
+
+            cfg.alpn_protocols = vec![
+                b"h2".to_vec(),
+                b"http/1.1".to_vec(),
+                ACME_TLS_ALPN_NAME.to_vec(), // 必须包含 ACME_TLS_ALPN_NAME，否则 Let's Encrypt 验证会失败
+            ];
+            cfg
+        } else {
+            load_manual_tls_config(&app_config.load().server)?
+        }
+    } else {
+        load_manual_tls_config(&app_config.load().server)?
+    };
+
     let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
 
     let https_connector = HttpsConnectorBuilder::new()
@@ -319,6 +362,20 @@ async fn main() -> Result<(), ProxyError> {
             }
         });
     }
+}
+
+fn load_manual_tls_config(server_conf: &ServerConfig) -> Result<rustls::ServerConfig, ProxyError> {
+    info!("🔓 ACME disabled. Loading manual certificates...");
+    let certs = load_certs(&server_conf.cert_file)?;
+    let key = load_private_key(&server_conf.key_file)?;
+
+    let mut cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| error(format!("TLS setup failed: {}", e)))?;
+
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(cfg)
 }
 
 fn init_tracer(config: &Option<TracingConfig>) {
@@ -1055,6 +1112,16 @@ struct ServerConfig {
     ip_limit: Option<RateLimitConfig>, // 新增
     // 新增
     tracing: Option<TracingConfig>,
+    acme: Option<AcmeConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct AcmeConfig {
+    enabled: bool,
+    domain: String,
+    email: String,
+    production: bool,
+    cache_dir: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]

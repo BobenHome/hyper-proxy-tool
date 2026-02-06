@@ -52,3 +52,13 @@ opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
 tracing-opentelemetry = "0.32"
 # HTTP 语义约定 (用于处理 Header)
 opentelemetry-http = "0.31"
+
+rustls-acme = { version = "0.15", features = ["tokio"]  }
+# futures 库用于处理 ACME 的异步流
+futures = "0.3"
+
+tokio-stream = "0.1.18"
+
+[[bin]]
+name = "hyper-proxy-tool"
+path = "src/main.rs"

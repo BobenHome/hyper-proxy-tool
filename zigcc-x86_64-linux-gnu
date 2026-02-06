@@ -1,0 +1,30 @@
+#!/bin/bash
+
+new_args=()
+for arg in "$@"; do
+  if [[ "$arg" == --target=x86_64-unknown-linux-gnu ]]; then
+    # 重映射到指定 GLIBC 版本的目标
+    new_args+=("--target=x86_64-linux-gnu.2.17")
+  else
+    new_args+=("$arg")
+  fi
+done
+
+# Detect if C++: check for .cc/.cpp/.cxx input files
+is_cpp=false
+for arg in "${new_args[@]}"; do
+  if [[ "$arg" == *.cc || "$arg" == *.cpp || "$arg" == *.cxx ]]; then
+    is_cpp=true
+    break
+  fi
+done
+
+# Increase file descriptor limit for this process
+ulimit -n 65536
+
+# Exec with correct mode and mapped args
+if [ "$is_cpp" = true ]; then
+  exec zig c++ "${new_args[@]}"
+else
+  exec zig cc "${new_args[@]}"
+fi

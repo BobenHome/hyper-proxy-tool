@@ -1,0 +1,9 @@
+[target.x86_64-unknown-linux-gnu]
+linker = "./zigcc-x86_64-linux-gnu"
+rustflags = [
+    "-C", "link-arg=--target=x86_64-linux-gnu.2.17",
+    "-C", "link-arg=-static-libgcc",
+    "-C", "relocation-model=static",
+    "-C", "split-debuginfo=packed",
+    "-C", "opt-level=2"
+]
