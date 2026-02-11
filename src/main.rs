@@ -13,6 +13,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::service::TowerToHyperService;
+use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -24,7 +25,7 @@ use opentelemetry_sdk::{propagation::TraceContextPropagator, resource::Resource}
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs;
@@ -79,6 +80,8 @@ struct AppState {
     ip_limiter: ArcSwap<Option<Arc<IpRateLimiter>>>,
     // 路由限流器映射: Route Path -> Limiter
     route_limiters: ArcSwap<HashMap<String, Arc<RouteRateLimiter>>>,
+    // 新增：JWT 解码密钥 (Option 因为可能没配 Secret)
+    jwt_key: ArcSwap<Option<Arc<DecodingKey>>>,
 }
 
 use hyper::header::HeaderName;
@@ -130,7 +133,7 @@ async fn main() -> Result<(), ProxyError> {
     info!("Config loaded: {:?}", initial_config);
 
     // 3. 初始化全局状态
-    let (initial_upstreams, initial_ip_limiter, initial_route_limiters) =
+    let (initial_upstreams, initial_ip_limiter, initial_route_limiters, jwt_key) =
         create_state_from_config(&initial_config);
 
     let app_config = Arc::new(ArcSwap::from_pointee(initial_config));
@@ -138,6 +141,7 @@ async fn main() -> Result<(), ProxyError> {
         upstreams: ArcSwap::new(Arc::new(initial_upstreams)),
         ip_limiter: ArcSwap::new(Arc::new(initial_ip_limiter)),
         route_limiters: ArcSwap::new(Arc::new(initial_route_limiters)),
+        jwt_key: ArcSwap::new(Arc::new(jwt_key)),
     });
 
     // 4. 初始化 Client
@@ -244,14 +248,19 @@ async fn main() -> Result<(), ProxyError> {
                                 manager_config.store(Arc::new(new_conf.clone()));
 
                                 // B. 更新 State (包括 Upstreams 和 Limiters)
-                                let (new_upstreams, new_ip_limiter, new_route_limiters) =
-                                    create_state_from_config(&new_conf);
+                                let (
+                                    new_upstreams,
+                                    new_ip_limiter,
+                                    new_route_limiters,
+                                    new_jwt_key,
+                                ) = create_state_from_config(&new_conf);
 
                                 manager_state.upstreams.store(Arc::new(new_upstreams));
                                 manager_state.ip_limiter.store(Arc::new(new_ip_limiter));
                                 manager_state
                                     .route_limiters
                                     .store(Arc::new(new_route_limiters));
+                                manager_state.jwt_key.store(Arc::new(new_jwt_key));
 
                                 // C. 重启健康检查
                                 cancel_token.cancel();
@@ -463,6 +472,7 @@ fn create_state_from_config(
     HashMap<String, Arc<UpstreamState>>,
     Option<Arc<IpRateLimiter>>,
     HashMap<String, Arc<RouteRateLimiter>>,
+    Option<Arc<DecodingKey>>,
 ) {
     // 1. Upstreams
     let mut upstreams_state = HashMap::new();
@@ -501,7 +511,75 @@ fn create_state_from_config(
         }
     }
 
-    (upstreams_state, ip_limiter, route_limiters)
+    // 4. 初始化 JWT Key
+    let jwt_key = if let Some(secret) = &config.server.jwt_secret {
+        Some(Arc::new(DecodingKey::from_secret(secret.as_bytes())))
+    } else {
+        None
+    };
+
+    (upstreams_state, ip_limiter, route_limiters, jwt_key)
+}
+
+// 返回值：
+// Ok(Some(claims)) -> 鉴权成功，返回用户信息
+// Ok(None) -> 该路由不需要鉴权
+// Err(response) -> 鉴权失败，直接返回 401 响应
+fn check_auth(
+    req: &Request<Incoming>,
+    route: &RouteConfig,
+    jwt_key_opt: &Option<Arc<DecodingKey>>,
+) -> Result<Option<Claims>, Response<BoxBody<Bytes, ProxyError>>> {
+    // 1. 如果路由不需要鉴权，直接通行
+    if !route.auth {
+        return Ok(None);
+    }
+
+    // 2. 如果路由需要鉴权，但 Server 没配 Secret，这是配置错误，返回 500
+    let key = match jwt_key_opt {
+        Some(k) => k,
+        None => {
+            error!("Route requires auth but no jwt_secret configured");
+            return Err(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(
+                    Full::new(Bytes::from("Auth Configuration Error"))
+                        .map_err(|e| match e {})
+                        .boxed(),
+                )
+                .unwrap());
+        }
+    };
+
+    // 3. 提取 Header: Authorization: Bearer <token>
+    let auth_header = match req.headers().get("Authorization") {
+        Some(h) => h.to_str().unwrap_or(""),
+        None => return Err(make_401("Missing Authorization Header")),
+    };
+
+    if !auth_header.starts_with("Bearer ") {
+        return Err(make_401("Invalid Auth Scheme"));
+    }
+
+    let token = &auth_header[7..]; // 去掉 "Bearer "
+
+    // 4. 验证 Token
+    let validation = Validation::new(Algorithm::HS256);
+
+    match jsonwebtoken::decode::<Claims>(token, key, &validation) {
+        Ok(token_data) => Ok(Some(token_data.claims)),
+        Err(e) => {
+            warn!("JWT Validation Failed: {:?}", e);
+            Err(make_401("Invalid Token"))
+        }
+    }
+}
+
+fn make_401(msg: &'static str) -> Response<BoxBody<Bytes, ProxyError>> {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .body(Full::new(Bytes::from(msg)).map_err(|e| match e {}).boxed())
+        .unwrap()
 }
 
 // ================== 健康检查逻辑 (支持取消) ==================
@@ -668,6 +746,17 @@ async fn proxy_handler(
         }
     }
 
+    // ================== JWT 鉴权拦截 ==================
+    // 加载密钥快照
+    let jwt_key_guard = state.jwt_key.load();
+
+    // 执行检查
+    let claims = match check_auth(&req, route, &jwt_key_guard) {
+        Ok(c) => c,                   // 鉴权成功，或者不需要鉴权
+        Err(resp) => return Ok(resp), // 鉴权失败，直接返回 401
+    };
+    // =================================================
+
     // 4. 获取 Upstream 状态
     // 加载状态快照
     let current_state_map = state.upstreams.load();
@@ -764,7 +853,18 @@ async fn proxy_handler(
     };
 
     // 拆解 Request
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts(); // parts 要改成 mut
+
+    // ================== 身份透传 ==================
+    // 如果鉴权成功，把 UserID 塞进 Header 发给上游
+    if let Some(claim) = claims {
+        // 注入 X-User-Id
+        if let Ok(val) = hyper::header::HeaderValue::from_str(&claim.sub) {
+            parts.headers.insert("X-User-Id", val);
+        }
+        // 注入其他信息，例如 X-User-Role 等
+    }
+    // ===========================================
 
     if should_buffer {
         // === 缓冲模式 ===
@@ -1098,6 +1198,15 @@ impl Drop for ConnectionGuard {
 
 // === 结构体定义 ===
 
+#[derive(Debug, Serialize, Deserialize)]
+struct Claims {
+    // 标准字段
+    sub: String, // Subject (通常是 UserID)
+    exp: Option<usize>, // Expiration time
+                 // 你可以根据业务添加更多字段，如 role, name 等
+                 // name: String,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 struct AppConfig {
     server: ServerConfig,
@@ -1113,6 +1222,8 @@ struct ServerConfig {
     // 新增
     tracing: Option<TracingConfig>,
     acme: Option<AcmeConfig>,
+    // 新增：JWT Secret
+    jwt_secret: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1141,6 +1252,9 @@ struct RouteConfig {
     #[serde(default)]
     strip_prefix: bool,
     limit: Option<RateLimitConfig>, // 新增
+    // 新增：该路由是否需要鉴权
+    #[serde(default)]
+    auth: bool,
 }
 #[derive(Debug, Deserialize, Clone)]
 struct RateLimitConfig {

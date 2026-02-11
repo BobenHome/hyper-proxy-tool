@@ -1,14 +1,16 @@
 # config.toml
 
 [server]
-listen_addr = "0.0.0.0:443" # ACME 生产环境必须监听 443
+listen_addr = "0.0.0.0:8443" # ACME 生产环境必须监听 443
 # 如果开启 ACME，下面两个文件路径将被忽略，但建议保留作为本地回退
 cert_file = "cert.pem"
 key_file = "key.pem"
+# 新增：JWT 密钥 (生产环境建议从环境变量读取，这里仅做演示)
+jwt_secret = "a-string-secret-at-least-256-bits-long"
 
 # === 新增：ACME 配置 ===
 [server.acme]
-enabled = true                 # 开关
+enabled = false                 # 开关
 domain = "47.100.136.50.sslip.io" # 真实域名
 email = "1539490741@qq.com"    # 用于接收过期通知
 production = false             # false=使用测试环境(Staging), true=正式环境
@@ -45,10 +47,19 @@ urls = ["http://127.0.0.1:9001"]
 path = "/api/v1"
 upstream = "httpbin_cluster"
 strip_prefix = true
+# 新增：开启鉴权
+auth = true
 # 该路由每秒总共允许 50 次请求
 [routes.limit]
 requests_per_second = 1
 burst = 100
+
+[[routes]]
+path = "/api/public"
+upstream = "httpbin_cluster"
+strip_prefix = true
+# 默认 false，无需鉴权
+auth = false
 
 [[routes]]
 path = "/ws"
