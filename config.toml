@@ -30,33 +30,45 @@ endpoint = "http://localhost:4317"
 
 # 定义上游服务池 (Map结构: name -> details)
 [upstreams]
-[upstreams.httpbin_cluster]
-urls = [
-  "https://httpbin.org",
-  "https://postman-echo.com"
-]
+  # 稳定版集群
+  [upstreams.stable]
+  urls = ["https://httpbin.org"]
 
-# 1. 定义本地 WS 上游
-[upstreams.local_ws]
-# 注意：虽然是 WebSocket，但底层建立连接时是 TCP/HTTP，
-# 所以这里写 http:// 即可，hyper 会处理握手。
-urls = ["http://127.0.0.1:9001"]
+  # 灰度版集群 (为了演示，可以用 postman-echo 或者另一个 httpbin)
+  [upstreams.canary]
+  urls = ["https://postman-echo.com"]
+
+  # 本地 WS 上游
+  [upstreams.local_ws]
+  # 注意：虽然是 WebSocket，但底层建立连接时是 TCP/HTTP，
+  # 所以这里写 http:// 即可，hyper 会处理握手。
+  urls = ["http://127.0.0.1:9001"]
 
 # === 路由规则===
 [[routes]]
 path = "/api/v1"
-upstream = "httpbin_cluster"
+upstream = "stable" # 默认走 stable
 strip_prefix = true
 # 新增：开启鉴权
-auth = true
-# 该路由每秒总共允许 50 次请求
-[routes.limit]
-requests_per_second = 1
-burst = 100
+auth = false
+  # 该路由每秒总共允许 50 次请求
+  [routes.limit]
+  requests_per_second = 1
+  burst = 100
+
+  # === 灰度配置 ===
+  [routes.canary]
+  upstream = "canary" # 灰度流量去哪里
+  weight = 20         # 20% 的流量走灰度 (0-100)
+
+  # Header 匹配规则 (可选)
+  # 如果请求包含 X-Canary: true，强制走灰度，忽略权重
+  header_key = "X-Canary"
+  header_value = "true"
 
 [[routes]]
 path = "/api/public"
-upstream = "httpbin_cluster"
+upstream = "stable"
 strip_prefix = true
 # 默认 false，无需鉴权
 auth = false

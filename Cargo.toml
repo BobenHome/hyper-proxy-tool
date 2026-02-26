@@ -61,6 +61,8 @@ tokio-stream = "0.1.18"
 
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 
+rand = "0.10"
+
 [[bin]]
 name = "hyper-proxy-tool"
 path = "src/main.rs"

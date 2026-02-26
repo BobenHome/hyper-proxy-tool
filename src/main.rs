@@ -22,6 +22,7 @@ use opentelemetry::{KeyValue, global};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::{propagation::TraceContextPropagator, resource::Resource};
+use rand::RngExt;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -713,6 +714,7 @@ async fn proxy_handler(
         .map(|r| r.upstream.as_str())
         .unwrap_or("unknown");
 
+    // 404 处理
     let route = match matched_route {
         Some(r) => r,
         None => {
@@ -757,17 +759,30 @@ async fn proxy_handler(
     };
     // =================================================
 
+    // ================== 灰度分流决策 ==================
+    // 之前是直接用 route.upstream
+    // 现在通过算法决定是用 route.upstream 还是 route.canary.upstream
+    let target_upstream_name = select_target_upstream(&req, route);
+
+    // 用于 Metrics 记录 (可选：记录是否命中了灰度)
+    let is_canary = target_upstream_name != route.upstream;
+    if is_canary {
+        info!("Canary hit! Routing to {}", target_upstream_name);
+    }
+    // =======================================================
+
     // 4. 获取 Upstream 状态
+    // 这里使用计算出来的 target_upstream_name
     // 加载状态快照
     let current_state_map = state.upstreams.load();
-    let upstream_state = match current_state_map.get(&route.upstream) {
+    let upstream_state = match current_state_map.get(target_upstream_name) {
         Some(s) => s,
         None => {
             error!(
                 "Upstream '{}' not found in state (Config mismatch?)",
-                route.upstream
+                target_upstream_name
             );
-            record_metrics(&method, "500", upstream_name, start);
+            record_metrics(&method, "500", target_upstream_name, start);
             return Ok(Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(
@@ -784,7 +799,7 @@ async fn proxy_handler(
     let active_urls = &**active_urls_guard;
 
     if active_urls.is_empty() {
-        record_metrics(&method, "502", upstream_name, start);
+        record_metrics(&method, "502", target_upstream_name, start);
         return Ok(Response::builder()
             .status(StatusCode::BAD_GATEWAY)
             .body(
@@ -944,7 +959,7 @@ async fn proxy_handler(
             match retry_service.oneshot(retry_req).await {
                 Ok(res) => {
                     let status = res.status().as_u16().to_string();
-                    record_metrics(&method_str, &status, upstream_name, start);
+                    record_metrics(&method_str, &status, target_upstream_name, start);
                     let res_boxed =
                         res.map(|b: Incoming| b.map_err(|e| Box::new(e) as ProxyError).boxed());
                     return Ok(res_boxed);
@@ -960,7 +975,7 @@ async fn proxy_handler(
         }
 
         error!("All upstreams failed. Last: {:?}", last_error);
-        record_metrics(&method_str, "502", upstream_name, start);
+        record_metrics(&method_str, "502", target_upstream_name, start);
         Ok(Response::builder()
             .status(502)
             .body(Empty::new().map_err(|e| match e {}).boxed())
@@ -1028,12 +1043,12 @@ async fn proxy_handler(
         match client.request(streaming_req).await {
             Ok(res) => {
                 let status = res.status().as_u16().to_string();
-                record_metrics(&method_str, &status, upstream_name, start);
+                record_metrics(&method_str, &status, target_upstream_name, start);
                 Ok(res.map(|b| b.map_err(|e| Box::new(e) as ProxyError).boxed()))
             }
             Err(err) => {
                 error!("Streaming failed: {:?}", err);
-                record_metrics(&method_str, "502", upstream_name, start);
+                record_metrics(&method_str, "502", target_upstream_name, start);
                 Ok(Response::builder()
                     .status(502)
                     .body(Empty::new().map_err(|e| match e {}).boxed())
@@ -1183,6 +1198,40 @@ fn is_websocket_request(req: &Request<Incoming>) -> bool {
     has_connection_upgrade && has_upgrade_websocket
 }
 
+// 根据灰度规则选择上游名称
+fn select_target_upstream<'a>(req: &Request<Incoming>, route: &'a RouteConfig) -> &'a str {
+    // 1. 检查是否有灰度配置
+    if let Some(canary) = &route.canary {
+        // 2. 规则一：Header 匹配 (高优先级)
+        // 只要 Header 匹配，强制走灰度，不看权重
+        if let Some(key) = &canary.header_key {
+            if let Some(val) = req.headers().get(key) {
+                // 如果配置了 specific value，必须相等
+                if let Some(expected_val) = &canary.header_value {
+                    if val.as_bytes() == expected_val.as_bytes() {
+                        return &canary.upstream;
+                    }
+                } else {
+                    // 如果没配置 value，只要 Key 存在就匹配
+                    return &canary.upstream;
+                }
+            }
+        }
+
+        // 3. 规则二：权重分流 (低优先级)
+        if canary.weight > 0 {
+            let random_val: u8 = rand::rng().random_range(1..=100);
+            if random_val <= canary.weight {
+                return &canary.upstream;
+            }
+        }
+    }
+
+    // 4. 默认走主上游
+    &route.upstream
+}
+
+// === 结构体定义 ===
 struct ConnectionGuard;
 impl ConnectionGuard {
     fn new() -> Self {
@@ -1196,14 +1245,12 @@ impl Drop for ConnectionGuard {
     }
 }
 
-// === 结构体定义 ===
-
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
     // 标准字段
     sub: String, // Subject (通常是 UserID)
     exp: Option<usize>, // Expiration time
-                 // 你可以根据业务添加更多字段，如 role, name 等
+                 // 根据业务添加更多字段，如 role, name 等
                  // name: String,
 }
 
@@ -1245,6 +1292,17 @@ struct TracingConfig {
 struct UpstreamConfig {
     urls: Vec<String>,
 }
+
+// CanaryConfig
+#[derive(Debug, Deserialize, Clone)]
+struct CanaryConfig {
+    upstream: String,
+    #[serde(default)]
+    weight: u8, // 0 - 100
+    header_key: Option<String>,
+    header_value: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 struct RouteConfig {
     path: String,
@@ -1252,9 +1310,11 @@ struct RouteConfig {
     #[serde(default)]
     strip_prefix: bool,
     limit: Option<RateLimitConfig>, // 新增
-    // 新增：该路由是否需要鉴权
+    // 该路由是否需要鉴权
     #[serde(default)]
     auth: bool,
+    // 灰度配置
+    canary: Option<CanaryConfig>,
 }
 #[derive(Debug, Deserialize, Clone)]
 struct RateLimitConfig {
