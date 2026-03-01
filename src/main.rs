@@ -55,6 +55,11 @@ use rustls_acme::acme::ACME_TLS_ALPN_NAME;
 use rustls_acme::{AcmeConfig as RustlsAcmeConfig, caches::DirCache};
 use tokio_stream::StreamExt; // 用于处理 ACME 事件流
 
+use anyhow::Context;
+use wasmtime::{Engine, Linker, Module, Store};
+use wasmtime_wasi::WasiCtxBuilder;
+use wasmtime_wasi::p1::{self, WasiP1Ctx};
+
 // 定义通用错误
 type ProxyError = Box<dyn std::error::Error + Send + Sync + 'static>;
 type HttpClient = Client<HttpsConnector<HttpConnector>, BoxBody<Bytes, ProxyError>>;
@@ -83,6 +88,8 @@ struct AppState {
     route_limiters: ArcSwap<HashMap<String, Arc<RouteRateLimiter>>>,
     // 新增：JWT 解码密钥 (Option 因为可能没配 Secret)
     jwt_key: ArcSwap<Option<Arc<DecodingKey>>>,
+    // Key: 插件文件名 (e.g., "auth.wasm"), Value: 预编译模块
+    plugins: ArcSwap<HashMap<String, Arc<PluginModule>>>,
 }
 
 use hyper::header::HeaderName;
@@ -134,7 +141,7 @@ async fn main() -> Result<(), ProxyError> {
     info!("Config loaded: {:?}", initial_config);
 
     // 3. 初始化全局状态
-    let (initial_upstreams, initial_ip_limiter, initial_route_limiters, jwt_key) =
+    let (initial_upstreams, initial_ip_limiter, initial_route_limiters, jwt_key, plugins) =
         create_state_from_config(&initial_config);
 
     let app_config = Arc::new(ArcSwap::from_pointee(initial_config));
@@ -143,6 +150,7 @@ async fn main() -> Result<(), ProxyError> {
         ip_limiter: ArcSwap::new(Arc::new(initial_ip_limiter)),
         route_limiters: ArcSwap::new(Arc::new(initial_route_limiters)),
         jwt_key: ArcSwap::new(Arc::new(jwt_key)),
+        plugins: ArcSwap::new(Arc::new(plugins)),
     });
 
     // 4. 初始化 Client
@@ -254,6 +262,7 @@ async fn main() -> Result<(), ProxyError> {
                                     new_ip_limiter,
                                     new_route_limiters,
                                     new_jwt_key,
+                                    new_plugins,
                                 ) = create_state_from_config(&new_conf);
 
                                 manager_state.upstreams.store(Arc::new(new_upstreams));
@@ -262,6 +271,7 @@ async fn main() -> Result<(), ProxyError> {
                                     .route_limiters
                                     .store(Arc::new(new_route_limiters));
                                 manager_state.jwt_key.store(Arc::new(new_jwt_key));
+                                manager_state.plugins.store(Arc::new(new_plugins));
 
                                 // C. 重启健康检查
                                 cancel_token.cancel();
@@ -474,6 +484,7 @@ fn create_state_from_config(
     Option<Arc<IpRateLimiter>>,
     HashMap<String, Arc<RouteRateLimiter>>,
     Option<Arc<DecodingKey>>,
+    HashMap<String, Arc<PluginModule>>,
 ) {
     // 1. Upstreams
     let mut upstreams_state = HashMap::new();
@@ -502,6 +513,8 @@ fn create_state_from_config(
 
     // 3. Route Limiters
     let mut route_limiters = HashMap::new();
+    // 4. Plugins
+    let mut plugins = HashMap::new();
     for route in &config.routes {
         if let Some(limit_conf) = &route.limit {
             if let Some(rps) = NonZeroU32::new(limit_conf.requests_per_second) {
@@ -510,16 +523,33 @@ fn create_state_from_config(
                 route_limiters.insert(route.path.clone(), Arc::new(RateLimiter::direct(quota)));
             }
         }
+        if let Some(path) = &route.plugin {
+            // 避免重复加载
+            if !plugins.contains_key(path) {
+                if let Ok(module) = PluginModule::new(path) {
+                    info!("Loaded Wasm plugin: {}", path);
+                    plugins.insert(path.clone(), Arc::new(module));
+                } else {
+                    error!("Failed to load Wasm plugin: {}", path);
+                }
+            }
+        }
     }
 
-    // 4. 初始化 JWT Key
+    // 5. 初始化 JWT Key
     let jwt_key = if let Some(secret) = &config.server.jwt_secret {
         Some(Arc::new(DecodingKey::from_secret(secret.as_bytes())))
     } else {
         None
     };
 
-    (upstreams_state, ip_limiter, route_limiters, jwt_key)
+    (
+        upstreams_state,
+        ip_limiter,
+        route_limiters,
+        jwt_key,
+        plugins,
+    )
 }
 
 // 返回值：
@@ -758,6 +788,50 @@ async fn proxy_handler(
         Err(resp) => return Ok(resp), // 鉴权失败，直接返回 401
     };
     // =================================================
+
+    // ================== Wasm 插件执行 ==================
+    if let Some(plugin_path) = &route.plugin {
+        let plugins_map = state.plugins.load();
+        if let Some(plugin) = plugins_map.get(plugin_path) {
+            // 准备输入数据
+            let mut header_map = HashMap::new();
+            for (k, v) in req.headers() {
+                if let Ok(val) = v.to_str() {
+                    header_map.insert(k.to_string(), val.to_string());
+                }
+            }
+
+            let input = WasmInput {
+                path: req.uri().path().to_string(),
+                headers: header_map,
+            };
+            let input_json = serde_json::to_string(&input).unwrap();
+
+            // 执行 Wasm
+            // 这里是阻塞执行 (Wasmtime 默认是同步的)，对于极高性能要求场景
+            // 应该使用 wasmtime 的 async feature 或者放入 spawn_blocking
+            // 这里为了简单演示直接调用
+            match plugin.run(input_json) {
+                Ok(output_json) => {
+                    if let Ok(decision) = serde_json::from_str::<WasmOutput>(&output_json) {
+                        if !decision.allow {
+                            warn!("Request blocked by Wasm plugin");
+                            return Ok(Response::builder()
+                                .status(decision.status_code)
+                                .body(
+                                    Full::new(Bytes::from(decision.body))
+                                        .map_err(|e| match e {})
+                                        .boxed(),
+                                )
+                                .unwrap());
+                        }
+                    }
+                }
+                Err(e) => error!("Wasm execution failed: {}", e),
+            }
+        }
+    }
+    // ===================================================
 
     // ================== 灰度分流决策 ==================
     // 之前是直接用 route.upstream
@@ -1315,7 +1389,10 @@ struct RouteConfig {
     auth: bool,
     // 灰度配置
     canary: Option<CanaryConfig>,
+    // 插件配置
+    plugin: Option<String>,
 }
+
 #[derive(Debug, Deserialize, Clone)]
 struct RateLimitConfig {
     requests_per_second: u32,
@@ -1373,4 +1450,74 @@ where
         }
         builder.body(req.body().clone()).ok()
     }
+}
+
+// === 定义 Store 的上下文结构体 ===
+struct WasmHostState {
+    wasi_ctx: WasiP1Ctx,
+}
+
+struct PluginModule {
+    engine: Engine,
+    module: Module,
+}
+
+impl PluginModule {
+    fn new(path: &str) -> Result<Self, anyhow::Error> {
+        let engine = Engine::default();
+
+        // 使用 map_err 将 wasmtime::Error 转为 anyhow::Error 后再使用 anyhow 的 .with_context
+        let module = Module::from_file(&engine, path)
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("Failed to load wasm file: {}", path))?;
+
+        Ok(Self { engine, module })
+    }
+
+    fn run(&self, req_json: String) -> Result<String, anyhow::Error> {
+        // 使用 build_p1() 创建 Preview 1 兼容上下文
+        let wasi_ctx = WasiCtxBuilder::new().inherit_stdio().build_p1();
+
+        let state = WasmHostState { wasi_ctx };
+        let mut store = Store::new(&self.engine, state);
+        let mut linker = Linker::new(&self.engine);
+
+        // 使用 p1 模块
+        p1::add_to_linker_sync(&mut linker, |s: &mut WasmHostState| &mut s.wasi_ctx)?;
+
+        let instance = linker.instantiate(&mut store, &self.module)?;
+
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or_else(|| anyhow::anyhow!("Wasm module missing 'memory' export"))?;
+
+        let alloc_func = instance.get_typed_func::<i32, i32>(&mut store, "alloc")?;
+        let input_bytes = req_json.as_bytes();
+        let ptr = alloc_func.call(&mut store, input_bytes.len() as i32)?;
+        memory.write(&mut store, ptr as usize, input_bytes)?;
+
+        let run_func = instance.get_typed_func::<(i32, i32), u64>(&mut store, "on_request")?;
+        let packed_ptr_len = run_func.call(&mut store, (ptr, input_bytes.len() as i32))?;
+
+        let res_ptr = (packed_ptr_len >> 32) as usize;
+        let res_len = (packed_ptr_len & 0xFFFFFFFF) as usize;
+        let mut res_buffer = vec![0u8; res_len];
+        memory.read(&mut store, res_ptr, &mut res_buffer)?;
+
+        Ok(String::from_utf8(res_buffer)?)
+    }
+}
+
+// === 定义交互结构体 ===
+#[derive(Serialize)]
+struct WasmInput {
+    path: String,
+    headers: HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct WasmOutput {
+    allow: bool,
+    status_code: u16,
+    body: String,
 }

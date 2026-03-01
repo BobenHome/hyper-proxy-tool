@@ -49,6 +49,9 @@ endpoint = "http://localhost:4317"
 path = "/api/v1"
 upstream = "stable" # 默认走 stable
 strip_prefix = true
+# 新增：插件路径
+plugin = "gateway_plugin.wasm"
+
 # 新增：开启鉴权
 auth = false
   # 该路由每秒总共允许 50 次请求
