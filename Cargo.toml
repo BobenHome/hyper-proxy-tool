@@ -68,6 +68,13 @@ wasmtime = "42.0.1"
 wasmtime-wasi = { version = "42.0.1", features = ["p1"] }
 anyhow = "1.0"
 
+# === 性能优化：替换全局内存分配器 ===
+# 只在非 Windows 环境下引入 jemalloc
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] } # 控制库
+
+
 [[bin]]
 name = "hyper-proxy-tool"
 path = "src/main.rs"

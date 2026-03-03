@@ -60,6 +60,17 @@ use wasmtime::{Engine, Linker, Module, Store};
 use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wasi::p1::{self, WasiP1Ctx};
 
+// ==============================================================================
+// 性能优化：使用 jemalloc 替换系统默认的内存分配器
+// 优势：极大地减少多线程高频小内存分配时的锁竞争，并显著降低长时间运行后的内存碎片
+// ==============================================================================
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 // 定义通用错误
 type ProxyError = Box<dyn std::error::Error + Send + Sync + 'static>;
 type HttpClient = Client<HttpsConnector<HttpConnector>, BoxBody<Bytes, ProxyError>>;
@@ -111,6 +122,9 @@ impl<'a> Injector for HeaderInjector<'a> {
 
 #[tokio::main]
 async fn main() -> Result<(), ProxyError> {
+    #[cfg(not(target_env = "msvc"))]
+    verify_jemalloc();
+
     // 1. 加载配置 (为了获取 Tracing 配置)
     let args = Cli::parse();
     let config_path = args.config.clone();
@@ -1303,6 +1317,24 @@ fn select_target_upstream<'a>(req: &Request<Incoming>, route: &'a RouteConfig) -
 
     // 4. 默认走主上游
     &route.upstream
+}
+
+#[cfg(not(target_env = "msvc"))]
+fn verify_jemalloc() {
+    use tikv_jemalloc_ctl::{epoch, stats};
+
+    // 推进 epoch 以刷新统计数据
+    epoch::advance().unwrap();
+
+    // 读取已分配的内存 (Bytes)
+    let allocated = stats::allocated::read().unwrap();
+    // 读取驻留内存 (Bytes)
+    let resident = stats::resident::read().unwrap();
+
+    println!(
+        "Jemalloc is working! Allocated: {} bytes, Resident: {} bytes",
+        allocated, resident
+    );
 }
 
 // === 结构体定义 ===
