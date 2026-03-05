@@ -1,7 +1,7 @@
 # ==============================================================================
 # Stage 1: Planner - 提取依赖配置，生成指纹
 # ==============================================================================
-FROM lukemathwalker/cargo-chef::latest-rust-1.91.0 AS chef
+FROM lukemathwalker/cargo-chef::latest-rust-1 AS chef
 WORKDIR /app
 
 FROM chef AS planner
