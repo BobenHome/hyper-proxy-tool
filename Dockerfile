@@ -14,6 +14,13 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ==============================================================================
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
+
+# 在编译依赖之前，提前把 Zig 交叉编译 Linker 脚本拷贝进去
+COPY ./zigcc-x86_64-linux-gnu ./zigcc-x86_64-linux-gnu
+# 如果是多个平台的脚本，或者在一个文件夹里，可以 COPY 整个文件夹
+# 确保脚本有执行权限
+RUN chmod +x ./zigcc-x86_64-linux-gnu
+
 # 这一步是魔法：只要 Cargo.toml 没有变，这步编译结果就会被 Docker 缓存
 # 这将 CI 构建时间从 10 分钟缩短到 10 秒
 RUN cargo chef cook --release --recipe-path recipe.json
