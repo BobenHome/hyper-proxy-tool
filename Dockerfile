@@ -26,6 +26,9 @@ RUN cargo chef cook --release --recipe-path recipe.json
 
 # 依赖预编译完成，现在拷贝真实的源代码
 COPY . .
+
+RUN rm -f .cargo/config.toml
+
 # 编译最终的二进制文件
 RUN cargo build --release --bin hyper-proxy-tool
 
