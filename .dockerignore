@@ -1,0 +1,7 @@
+# 忽略掉本地的跨平台编译配置
+.cargo/config.toml
+
+target/
+.git/
+.acme_cache/
+*.wasm
