@@ -33,6 +33,11 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
 
+      # 设置 QEMU 模拟器
+      # 它是让 x86 的 Ubuntu 机器能够运行/编译 ARM64 指令的基础
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx (支持高级缓存)
         uses: docker/setup-buildx-action@v3
 
@@ -41,6 +46,9 @@ jobs:
         with:
           context: .
           push: true
+          # 指定多个构建平台
+          # Buildx 会并行构建这两个版本，并合并为一个 Manifest 推送到云端
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # 使用 GitHub Actions 的 Cache 来加速 cargo-chef
