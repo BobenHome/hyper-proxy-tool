@@ -39,10 +39,10 @@ endpoint = "http://localhost:4317"
   urls = ["https://postman-echo.com"]
 
   # 本地 WS 上游
-  [upstreams.local_ws]
+  # [upstreams.local_ws]
   # 注意：虽然是 WebSocket，但底层建立连接时是 TCP/HTTP，
   # 所以这里写 http:// 即可，hyper 会处理握手。
-  urls = ["http://127.0.0.1:9001"]
+  # urls = ["http://127.0.0.1:9001"]
 
 # === 路由规则===
 [[routes]]
@@ -50,7 +50,7 @@ path = "/api/v1"
 upstream = "stable" # 默认走 stable
 strip_prefix = true
 # 新增：插件路径
-plugin = "gateway_plugin.wasm"
+# plugin = "gateway_plugin.wasm"
 
 # 新增：开启鉴权
 auth = false
@@ -76,7 +76,7 @@ strip_prefix = true
 # 默认 false，无需鉴权
 auth = false
 
-[[routes]]
-path = "/ws"
-upstream = "local_ws"
-strip_prefix = false
+# [[routes]]
+# path = "/ws"
+# upstream = "local_ws"
+# strip_prefix = false

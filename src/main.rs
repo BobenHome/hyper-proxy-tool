@@ -56,6 +56,7 @@ use rustls_acme::{AcmeConfig as RustlsAcmeConfig, caches::DirCache};
 use tokio_stream::StreamExt; // 用于处理 ACME 事件流
 
 use anyhow::Context;
+use moka::future::Cache;
 use wasmtime::{Engine, Linker, Module, Store};
 use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wasi::p1::{self, WasiP1Ctx};
@@ -101,6 +102,9 @@ struct AppState {
     jwt_key: ArcSwap<Option<Arc<DecodingKey>>>,
     // Key: 插件文件名 (e.g., "auth.wasm"), Value: 预编译模块
     plugins: ArcSwap<HashMap<String, Arc<PluginModule>>>,
+    // 全局 HTTP 缓存
+    // Moka Cache 内部已经用了 Arc 和无锁机制，所以不需要包裹在 ArcSwap 中
+    response_cache: Cache<String, CachedResponse>,
 }
 
 use hyper::header::HeaderName;
@@ -159,12 +163,18 @@ async fn main() -> Result<(), ProxyError> {
         create_state_from_config(&initial_config);
 
     let app_config = Arc::new(ArcSwap::from_pointee(initial_config));
+
+    // 初始化一个最大容量为 10,000 个条目的缓存
+    // 采用 W-TinyLFU 算法，自动淘汰最不常用的数据
+    let response_cache = Cache::builder().max_capacity(10_000).build();
+
     let app_state = Arc::new(AppState {
         upstreams: ArcSwap::new(Arc::new(initial_upstreams)),
         ip_limiter: ArcSwap::new(Arc::new(initial_ip_limiter)),
         route_limiters: ArcSwap::new(Arc::new(initial_route_limiters)),
         jwt_key: ArcSwap::new(Arc::new(jwt_key)),
         plugins: ArcSwap::new(Arc::new(plugins)),
+        response_cache,
     });
 
     // 4. 初始化 Client
@@ -859,6 +869,45 @@ async fn proxy_handler(
     }
     // =======================================================
 
+    // 路径处理
+    let path_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or(&req_path)
+        .to_string();
+
+    // 生成当前请求的唯一缓存 Key: "METHOD:PATH?QUERY"
+    let cache_key = format!("{}:{}", method_str, path_query);
+
+    // ================== 缓存拦截层 (Cache Read) ==================
+    // 只有 GET 请求允许走缓存
+    if method_str == "GET" {
+        if let Some(cached) = state.response_cache.get(&cache_key).await {
+            // 检查是否过期
+            if Instant::now() < cached.expires_at {
+                info!("⚡ Cache HIT for {}", cache_key);
+                record_metrics(&method_str, cached.status.as_str(), "cache", start);
+
+                // 重组缓存的响应返回给客户端
+                let mut builder = Response::builder().status(cached.status);
+                for (k, v) in &cached.headers {
+                    builder = builder.header(k, v);
+                }
+                // 打上一个标记，告诉客户端这是从网关缓存出来的
+                builder = builder.header("X-Cache", "HIT");
+
+                let body = Full::new(cached.body).map_err(|e| match e {}).boxed();
+                return Ok(builder.body(body).unwrap());
+            } else {
+                // 已过期，异步清理（moka 也会自动清理，这里主动移除）
+                state.response_cache.remove(&cache_key).await;
+            }
+        }
+    }
+    info!("🐌 Cache MISS for {}", cache_key);
+    // ============================================================
+
     // 4. 获取 Upstream 状态
     // 这里使用计算出来的 target_upstream_name
     // 加载状态快照
@@ -916,14 +965,6 @@ async fn proxy_handler(
         info!("WebSocket LB -> {}", upstream_url_str);
         return handle_websocket(req, client, upstream_base).await;
     }
-
-    // 路径处理
-    let path_query = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or(&req_path)
-        .to_string();
 
     let final_path = if route.strip_prefix {
         if let Some(stripped) = path_query.strip_prefix(&route.path) {
@@ -1046,8 +1087,67 @@ async fn proxy_handler(
 
             match retry_service.oneshot(retry_req).await {
                 Ok(res) => {
-                    let status = res.status().as_u16().to_string();
-                    record_metrics(&method_str, &status, target_upstream_name, start);
+                    let status = res.status();
+                    let status_str = status.as_u16().to_string();
+                    record_metrics(&method_str, &status_str, target_upstream_name, start);
+
+                    // ================== 缓存写入层 (Cache Write) ==================
+                    if method_str == "GET" && status.is_success() {
+                        // 检查上游是否允许缓存
+                        if let Some(max_age) = parse_cache_max_age(res.headers()) {
+                            // 检查响应体大小，防止缓存把内存撑爆
+                            let res_length = res
+                                .headers()
+                                .get(CONTENT_LENGTH)
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .unwrap_or(u64::MAX); // 没有 length 则不缓存
+
+                            if res_length <= MAX_BUFFER_SIZE {
+                                // 必须把响应体读入内存才能存入缓存
+                                let (res_parts, res_body) = res.into_parts();
+                                match res_body.collect().await {
+                                    Ok(collected) => {
+                                        let body_bytes = collected.to_bytes();
+
+                                        let cached_res = CachedResponse {
+                                            status: res_parts.status,
+                                            headers: res_parts.headers.clone(),
+                                            body: body_bytes.clone(),
+                                            expires_at: Instant::now() + max_age,
+                                        };
+
+                                        state
+                                            .response_cache
+                                            .insert(cache_key.clone(), cached_res)
+                                            .await;
+
+                                        let mut builder =
+                                            Response::builder().status(res_parts.status);
+                                        for (k, v) in &res_parts.headers {
+                                            builder = builder.header(k, v);
+                                        }
+                                        builder = builder.header("X-Cache", "MISS");
+
+                                        let final_body =
+                                            Full::new(body_bytes).map_err(|e| match e {}).boxed();
+                                        return Ok(builder.body(final_body).unwrap());
+                                    }
+                                    Err(_) => {
+                                        // If collecting body fails, we'd usually return an error
+                                        // because 'res' is already gone.
+                                        return Err(anyhow::anyhow!(
+                                            "Failed to read upstream body"
+                                        )
+                                        .into());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // ==============================================================
+
+                    // 如果不满足缓存条件，直接透传原来的 res
                     let res_boxed =
                         res.map(|b: Incoming| b.map_err(|e| Box::new(e) as ProxyError).boxed());
                     return Ok(res_boxed);
@@ -1337,6 +1437,35 @@ fn verify_jemalloc() {
     );
 }
 
+// 解析上游响应的 Cache-Control 头
+fn parse_cache_max_age(headers: &hyper::HeaderMap) -> Option<Duration> {
+    let cache_control = headers
+        .get(hyper::header::CACHE_CONTROL)?
+        .to_str()
+        .ok()?
+        .to_lowercase();
+
+    // 如果包含 no-store 或 private，严格禁止缓存
+    if cache_control.contains("no-store") || cache_control.contains("private") {
+        return None;
+    }
+
+    // 提取 max-age=xxx
+    if let Some(idx) = cache_control.find("max-age=") {
+        let num_str: String = cache_control[idx + 8..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+
+        if let Ok(seconds) = num_str.parse::<u64>() {
+            if seconds > 0 {
+                return Some(Duration::from_secs(seconds));
+            }
+        }
+    }
+    None
+}
+
 // === 结构体定义 ===
 struct ConnectionGuard;
 impl ConnectionGuard {
@@ -1552,4 +1681,12 @@ struct WasmOutput {
     allow: bool,
     status_code: u16,
     body: String,
+}
+
+#[derive(Clone)]
+struct CachedResponse {
+    status: StatusCode,
+    headers: hyper::HeaderMap,
+    body: Bytes,
+    expires_at: Instant, // 缓存过期时间
 }
