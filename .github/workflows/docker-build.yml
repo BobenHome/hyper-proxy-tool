@@ -4,6 +4,12 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - "*.md"
+      - "docs/**"
+      - ".github/**"
+      - ".markdownlint.json"
+      - ".gitignore"
     tags:
       - "v*.*.*" # 匹配 v1.0.0 类型 Tag
 
