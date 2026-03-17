@@ -4,6 +4,8 @@ use clap::Parser;
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed, keyed};
 use governor::{Quota, RateLimiter};
+use h3_quinn::Connection as H3QuinnConnection;
+use h3_quinn::quinn;
 use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::header::CONTENT_LENGTH;
@@ -23,8 +25,6 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::{propagation::TraceContextPropagator, resource::Resource};
 use rand::RngExt;
-use tracing_opentelemetry::OpenTelemetrySpanExt;
-
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -49,6 +49,7 @@ use tower::service_fn;
 use tower::{BoxError, ServiceBuilder, ServiceExt};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, instrument, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::{Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
 use rustls_acme::acme::ACME_TLS_ALPN_NAME;
@@ -129,6 +130,12 @@ async fn main() -> Result<(), ProxyError> {
     #[cfg(not(target_env = "msvc"))]
     verify_jemalloc();
 
+    // 安装默认的加密提供者（必须在使用 rustls 之前）
+    // 这是因为 quinn 和 rustls 需要明确的加密后端
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install default crypto provider");
+
     // 1. 加载配置 (为了获取 Tracing 配置)
     let args = Cli::parse();
     let config_path = args.config.clone();
@@ -182,7 +189,7 @@ async fn main() -> Result<(), ProxyError> {
     let current_config = app_config.load();
 
     // ================== TLS 配置==================
-    let server_config = if let Some(acme) = &current_config.server.acme {
+    let (tcp_server_config, quic_server_config) = if let Some(acme) = &current_config.server.acme {
         if acme.enabled {
             info!("🔒 ACME enabled. Domain: {}", acme.domain);
             // 我们需要 Clone 出拥有所有权的数据，以满足 'static 要求
@@ -209,16 +216,23 @@ async fn main() -> Result<(), ProxyError> {
             });
 
             // 4. 构建动态 ServerConfig
-            let mut cfg = rustls::ServerConfig::builder()
+            let mut tcp_cfg = rustls::ServerConfig::builder()
                 .with_no_client_auth()
-                .with_cert_resolver(resolver); // 使用上面获取的 resolver
+                .with_cert_resolver(resolver.clone()); // 使用上面获取的 resolver 克隆给 TCP
 
-            cfg.alpn_protocols = vec![
+            tcp_cfg.alpn_protocols = vec![
                 b"h2".to_vec(),
                 b"http/1.1".to_vec(),
                 ACME_TLS_ALPN_NAME.to_vec(), // 必须包含 ACME_TLS_ALPN_NAME，否则 Let's Encrypt 验证会失败
             ];
-            cfg
+            // 5. 构建 QUIC 动态 ServerConfig
+            let mut quic_cfg = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(resolver); // 移动给 QUIC
+
+            quic_cfg.alpn_protocols = vec![b"h3".to_vec()];
+
+            (tcp_cfg, quic_cfg)
         } else {
             load_manual_tls_config(&app_config.load().server)?
         }
@@ -226,7 +240,26 @@ async fn main() -> Result<(), ProxyError> {
         load_manual_tls_config(&app_config.load().server)?
     };
 
-    let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
+    // 1. 初始化 TCP Acceptor
+    let tls_acceptor = TlsAcceptor::from(Arc::new(tcp_server_config));
+
+    // 2. 初始化 QUIC Endpoint
+    let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(quic_server_config)
+        .map_err(|e| error(format!("Failed to build QUIC crypto config: {}", e)))?;
+
+    let quinn_server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+
+    let addr: SocketAddr = app_config
+        .load()
+        .server
+        .listen_addr
+        .parse()
+        .map_err(|e| error(format!("Invalid listen address: {}", e)))?;
+
+    let quic_endpoint = quinn::Endpoint::server(quinn_server_config, addr)
+        .map_err(|e| error(format!("Failed to bind UDP port for QUIC: {}", e)))?;
+
+    info!("🚀 HTTP/3 (QUIC) Server listening on udp://{}", addr);
 
     let https_connector = HttpsConnectorBuilder::new()
         .with_native_roots()?
@@ -322,6 +355,79 @@ async fn main() -> Result<(), ProxyError> {
         }
     });
 
+    // 启动后台任务处理 QUIC/HTTP3 请求
+    let quic_client = client.clone();
+    let quic_config = app_config.clone();
+    let quic_state = app_state.clone();
+
+    tokio::spawn(async move {
+        while let Some(incoming_conn) = quic_endpoint.accept().await {
+            let client = quic_client.clone();
+            let config = quic_config.clone();
+            let state = quic_state.clone();
+
+            tokio::spawn(async move {
+                let connection = match incoming_conn.await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("QUIC connection handshake failed: {:?}", e);
+                        return;
+                    }
+                };
+
+                let remote_addr = connection.remote_address();
+                info!("Established QUIC connection from {:?}", remote_addr);
+
+                // 将 quinn::Connection 包装为 h3_quinn::Connection
+                let h3_conn = H3QuinnConnection::new(connection);
+
+                // 建立 HTTP/3 服务端连接
+                let mut h3_server_conn = match h3::server::builder()
+                    .build::<_, bytes::Bytes>(h3_conn)
+                    .await
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("Failed to build HTTP/3 connection: {:?}", e);
+                        return;
+                    }
+                };
+
+                // 循环接受该连接上的 HTTP/3 请求流
+                loop {
+                    match h3_server_conn.accept().await {
+                        Ok(Some(resolver)) => {
+                            let client = client.clone();
+                            let config = config.clone();
+                            let state = state.clone();
+
+                            tokio::spawn(async move {
+                                handle_http3_request(resolver, client, config, state, remote_addr)
+                                    .await;
+                            });
+                        }
+                        Ok(None) => {
+                            info!("HTTP/3 connection closed gracefully from {:?}", remote_addr);
+                            break;
+                        }
+                        Err(e) => {
+                            // 检查是否是正常的连接关闭
+                            let error_str = format!("{:?}", e);
+                            if error_str.contains("NO_ERROR")
+                                || error_str.contains("ConnectionClosed")
+                            {
+                                info!("HTTP/3 connection closed from {:?}", remote_addr);
+                            } else {
+                                error!("HTTP/3 connection error from {:?}: {:?}", remote_addr, e);
+                            }
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
     // 5. 启动 Server
     let addr: SocketAddr = app_config
         .load()
@@ -408,18 +514,31 @@ async fn main() -> Result<(), ProxyError> {
     }
 }
 
-fn load_manual_tls_config(server_conf: &ServerConfig) -> Result<rustls::ServerConfig, ProxyError> {
+// 修改返回类型为包含两个 ServerConfig 的元组
+fn load_manual_tls_config(
+    server_conf: &ServerConfig,
+) -> Result<(rustls::ServerConfig, rustls::ServerConfig), ProxyError> {
     info!("🔓 ACME disabled. Loading manual certificates...");
     let certs = load_certs(&server_conf.cert_file)?;
     let key = load_private_key(&server_conf.key_file)?;
 
-    let mut cfg = rustls::ServerConfig::builder()
+    // 1. 构建 TCP 的配置
+    let mut tcp_cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        // 注意：certs 是 clone，key 是 clone_key
+        .with_single_cert(certs.clone(), key.clone_key())
+        .map_err(|e| error(format!("TLS setup failed: {}", e)))?;
+    tcp_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    // 2. 构建 QUIC 的配置
+    let mut quic_cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
-        .map_err(|e| error(format!("TLS setup failed: {}", e)))?;
+        .map_err(|e| error(format!("QUIC TLS setup failed: {}", e)))?;
+    // QUIC 必须独占 h3
+    quic_cfg.alpn_protocols = vec![b"h3".to_vec()];
 
-    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    Ok(cfg)
+    Ok((tcp_cfg, quic_cfg))
 }
 
 fn init_tracer(config: &Option<TracingConfig>) {
@@ -1086,10 +1205,19 @@ async fn proxy_handler(
                 }));
 
             match retry_service.oneshot(retry_req).await {
-                Ok(res) => {
+                Ok(mut res) => {
                     let status = res.status();
                     let status_str = status.as_u16().to_string();
                     record_metrics(&method_str, &status_str, target_upstream_name, start);
+
+                    // ================== 新增：注入 Alt-Svc 引导头 ==================
+                    // 告诉浏览器：本服务器的 UDP 8443 端口支持 HTTP/3
+                    if let Ok(alt_svc_val) =
+                        hyper::header::HeaderValue::from_str("h3=\":8443\"; ma=86400")
+                    {
+                        res.headers_mut().insert("alt-svc", alt_svc_val);
+                    }
+                    // ==============================================================
 
                     // ================== 缓存写入层 (Cache Write) ==================
                     if method_str == "GET" && status.is_success() {
@@ -1464,6 +1592,184 @@ fn parse_cache_max_age(headers: &hyper::HeaderMap) -> Option<Duration> {
         }
     }
     None
+}
+
+async fn handle_http3_request(
+    resolver: h3::server::RequestResolver<H3QuinnConnection, Bytes>,
+    client: Arc<HttpClient>,
+    config: Arc<ArcSwap<AppConfig>>,
+    state: Arc<AppState>,
+    remote_addr: SocketAddr,
+) {
+    let (req, mut stream) = match resolver.resolve_request().await {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Failed to resolve HTTP/3 request: {:?}", e);
+            return;
+        }
+    };
+
+    // 读取请求 body
+    let mut body_bytes = bytes::BytesMut::new();
+    loop {
+        match stream.recv_data().await {
+            Ok(Some(mut data)) => {
+                use bytes::Buf;
+                while data.remaining() > 0 {
+                    let chunk = data.copy_to_bytes(data.remaining());
+                    body_bytes.extend_from_slice(&chunk);
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                error!("Failed to read HTTP/3 request body: {:?}", e);
+                return;
+            }
+        }
+    }
+
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let headers = req.headers().clone();
+    let body_data = bytes::Bytes::from(body_bytes);
+
+    let resp = match proxy_http3_request(
+        method,
+        uri,
+        headers,
+        body_data,
+        client,
+        config,
+        state,
+        remote_addr,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            error!("HTTP/3 proxy_handler error: {:?}", e);
+            let error_resp = Response::builder().status(502).body(()).unwrap();
+            let _ = stream.send_response(error_resp).await;
+            let _ = stream.finish().await;
+            return;
+        }
+    };
+
+    // 将 hyper Response 转为 h3 响应
+    let (resp_parts, resp_body) = resp.into_parts();
+    let h3_resp = Response::from_parts(resp_parts, ());
+
+    if let Err(e) = stream.send_response(h3_resp).await {
+        error!("Failed to send HTTP/3 response headers: {:?}", e);
+        return;
+    }
+
+    // 收集并发送响应 body
+    match resp_body.collect().await {
+        Ok(collected) => {
+            let data = collected.to_bytes();
+            if !data.is_empty() {
+                if let Err(e) = stream.send_data(data).await {
+                    error!("Failed to send HTTP/3 response body: {:?}", e);
+                    return;
+                }
+            }
+        }
+        Err(e) => {
+            error!("Failed to collect HTTP/3 response body: {:?}", e);
+            return;
+        }
+    }
+
+    if let Err(e) = stream.finish().await {
+        error!("Failed to finish HTTP/3 stream: {:?}", e);
+    }
+}
+
+// HTTP/3 专用的简化代理处理函数
+// 不支持 WebSocket 和某些高级特性
+async fn proxy_http3_request(
+    method: hyper::Method,
+    uri: hyper::Uri,
+    headers: hyper::HeaderMap,
+    body: bytes::Bytes,
+    client: Arc<HttpClient>,
+    config: Arc<ArcSwap<AppConfig>>,
+    state: Arc<AppState>,
+    _remote_addr: SocketAddr,
+) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError> {
+    let path = uri.path().to_string();
+
+    // 健康检查
+    if path == "/health" {
+        let body = Full::new(Bytes::from("OK (HTTP/3)"))
+            .map_err(|e| match e {})
+            .boxed();
+        return Ok(Response::new(body));
+    }
+
+    // 路由匹配
+    let current_config = config.load();
+    let route = current_config
+        .routes
+        .iter()
+        .find(|r| path.starts_with(&r.path))
+        .ok_or_else(|| error("No matching route".to_string()))?;
+
+    // 获取上游
+    let upstreams_guard = state.upstreams.load();
+    let upstream_state = upstreams_guard
+        .get(&route.upstream)
+        .ok_or_else(|| error(format!("Upstream {} not found", route.upstream)))?;
+
+    let active_urls = upstream_state.active_urls.load();
+    if active_urls.is_empty() {
+        return Ok(Response::builder()
+            .status(503)
+            .body(Empty::new().map_err(|e| match e {}).boxed())
+            .unwrap());
+    }
+
+    // 简单的轮询选择
+    let current_count = upstream_state.counter.fetch_add(1, Ordering::Relaxed);
+    let index = current_count % active_urls.len();
+    let upstream_url = &active_urls[index];
+
+    // 构建上游请求
+    let upstream_uri = format!("{}{}", upstream_url.trim_end_matches('/'), path);
+    let mut req_builder = Request::builder()
+        .method(method)
+        .uri(upstream_uri)
+        .version(hyper::Version::HTTP_11);
+
+    for (k, v) in &headers {
+        req_builder = req_builder.header(k, v);
+    }
+
+    let upstream_req = req_builder
+        .body(Full::new(body).map_err(|e| match e {}).boxed())
+        .map_err(|e| error(format!("Failed to build request: {}", e)))?;
+
+    // 发送请求
+    match client.request(upstream_req).await {
+        Ok(mut res) => {
+            // 注入 Alt-Svc 头
+            if let Ok(alt_svc_val) = hyper::header::HeaderValue::from_str("h3=\":8443\"; ma=86400")
+            {
+                res.headers_mut().insert("alt-svc", alt_svc_val);
+            }
+
+            let res_boxed = res.map(|b: Incoming| b.map_err(|e| Box::new(e) as ProxyError).boxed());
+            Ok(res_boxed)
+        }
+        Err(e) => {
+            error!("HTTP/3 upstream request failed: {:?}", e);
+            Ok(Response::builder()
+                .status(502)
+                .body(Empty::new().map_err(|e| match e {}).boxed())
+                .unwrap())
+        }
+    }
 }
 
 // === 结构体定义 ===

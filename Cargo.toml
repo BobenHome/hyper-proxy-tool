@@ -71,6 +71,12 @@ anyhow = "1.0"
 # 高性能并发缓存库
 moka = { version = "0.12", features =["future"] }
 
+# QUIC 传输层实现
+quinn = "0.11"
+# HTTP/3 协议层实现
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+
 # === 性能优化：替换全局内存分配器 ===
 # 只在非 Windows 环境下引入 jemalloc
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
