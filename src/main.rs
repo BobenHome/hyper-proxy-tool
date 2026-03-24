@@ -1696,11 +1696,13 @@ async fn proxy_http3_request(
     client: Arc<HttpClient>,
     config: Arc<ArcSwap<AppConfig>>,
     state: Arc<AppState>,
-    _remote_addr: SocketAddr,
+    remote_addr: SocketAddr,
 ) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError> {
+    let start = Instant::now();
+    let method_str = method.to_string();
     let path = uri.path().to_string();
 
-    // 健康检查
+    // 1. 健康检查
     if path == "/health" {
         let body = Full::new(Bytes::from("OK (HTTP/3)"))
             .map_err(|e| match e {})
@@ -1708,68 +1710,414 @@ async fn proxy_http3_request(
         return Ok(Response::new(body));
     }
 
-    // 路由匹配
+    // 2. IP 限流
+    if let Some(limiter) = &**state.ip_limiter.load() {
+        if limiter.check_key(&remote_addr.ip()).is_err() {
+            warn!("HTTP/3 IP Rate Limit Exceeded: {}", remote_addr.ip());
+            record_metrics(&method_str, "429", "ip_limit", start);
+            return Ok(Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .body(
+                    Full::new(Bytes::from("429 Too Many Requests (IP)"))
+                        .map_err(|e| match e {})
+                        .boxed(),
+                )
+                .unwrap());
+        }
+    }
+
+    // 3. 路由匹配 + 404
     let current_config = config.load();
-    let route = current_config
-        .routes
-        .iter()
-        .find(|r| path.starts_with(&r.path))
-        .ok_or_else(|| error("No matching route".to_string()))?;
+    let mut matched_route: Option<&RouteConfig> = None;
+    for route in &current_config.routes {
+        if path.starts_with(&route.path) {
+            matched_route = Some(route);
+            break;
+        }
+    }
+    let upstream_name = matched_route
+        .map(|r| r.upstream.as_str())
+        .unwrap_or("unknown");
+    let route = match matched_route {
+        Some(r) => r,
+        None => {
+            info!("HTTP/3 No route matched for path: {}", path);
+            record_metrics(&method_str, "404", upstream_name, start);
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(
+                    Full::new(Bytes::from("404 Not Found"))
+                        .map_err(|e| match e {})
+                        .boxed(),
+                )
+                .unwrap());
+        }
+    };
 
-    // 获取上游
-    let upstreams_guard = state.upstreams.load();
-    let upstream_state = upstreams_guard
-        .get(&route.upstream)
-        .ok_or_else(|| error(format!("Upstream {} not found", route.upstream)))?;
+    // 4. 路由限流
+    let route_limiters = state.route_limiters.load();
+    if let Some(limiter) = route_limiters.get(&route.path) {
+        if limiter.check().is_err() {
+            warn!("HTTP/3 Route Rate Limit Exceeded: {}", route.path);
+            record_metrics(&method_str, "429", "route_limit", start);
+            return Ok(Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .body(
+                    Full::new(Bytes::from("429 Too Many Requests (Route)"))
+                        .map_err(|e| match e {})
+                        .boxed(),
+                )
+                .unwrap());
+        }
+    }
 
-    let active_urls = upstream_state.active_urls.load();
+    // 5. JWT 鉴权（内联）
+    let jwt_key_guard = state.jwt_key.load();
+    let claims: Option<Claims> = if route.auth {
+        let key = match &**jwt_key_guard {
+            Some(k) => k,
+            None => {
+                error!("HTTP/3 Route requires auth but no jwt_secret configured");
+                return Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(
+                        Full::new(Bytes::from("Auth Configuration Error"))
+                            .map_err(|e| match e {})
+                            .boxed(),
+                    )
+                    .unwrap());
+            }
+        };
+        let auth_header = match headers.get("Authorization") {
+            Some(h) => h.to_str().unwrap_or("").to_string(),
+            None => {
+                return Ok(make_401("Missing Authorization Header"));
+            }
+        };
+        if !auth_header.starts_with("Bearer ") {
+            return Ok(make_401("Invalid Auth Scheme"));
+        }
+        let token = &auth_header[7..];
+        let validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+        match jsonwebtoken::decode::<Claims>(token, key, &validation) {
+            Ok(token_data) => Some(token_data.claims),
+            Err(e) => {
+                warn!("HTTP/3 JWT Validation Failed: {:?}", e);
+                return Ok(make_401("Invalid Token"));
+            }
+        }
+    } else {
+        None
+    };
+
+    // 6. Wasm 插件
+    if let Some(plugin_path) = &route.plugin {
+        let plugins_map = state.plugins.load();
+        if let Some(plugin) = plugins_map.get(plugin_path) {
+            let mut header_map = HashMap::new();
+            for (k, v) in &headers {
+                if let Ok(val) = v.to_str() {
+                    header_map.insert(k.to_string(), val.to_string());
+                }
+            }
+            let input = WasmInput {
+                path: path.clone(),
+                headers: header_map,
+            };
+            let input_json = serde_json::to_string(&input).unwrap();
+            match plugin.run(input_json) {
+                Ok(output_json) => {
+                    if let Ok(decision) = serde_json::from_str::<WasmOutput>(&output_json) {
+                        if !decision.allow {
+                            warn!("HTTP/3 Request blocked by Wasm plugin");
+                            return Ok(Response::builder()
+                                .status(decision.status_code)
+                                .body(
+                                    Full::new(Bytes::from(decision.body))
+                                        .map_err(|e| match e {})
+                                        .boxed(),
+                                )
+                                .unwrap());
+                        }
+                    }
+                }
+                Err(e) => error!("HTTP/3 Wasm execution failed: {}", e),
+            }
+        }
+    }
+
+    // 7. Canary 灰度路由（内联 select_target_upstream 逻辑）
+    let target_upstream_name: &str = if let Some(canary) = &route.canary {
+        let mut selected = route.upstream.as_str();
+        if let Some(key) = &canary.header_key {
+            if let Some(val) = headers.get(key) {
+                if let Some(expected_val) = &canary.header_value {
+                    if val.as_bytes() == expected_val.as_bytes() {
+                        selected = &canary.upstream;
+                    }
+                } else {
+                    selected = &canary.upstream;
+                }
+            }
+        }
+        if selected == route.upstream.as_str() && canary.weight > 0 {
+            let random_val: u8 = rand::rng().random_range(1..=100);
+            if random_val <= canary.weight {
+                selected = &canary.upstream;
+            }
+        }
+        if selected != route.upstream.as_str() {
+            info!("HTTP/3 Canary hit! Routing to {}", selected);
+        }
+        selected
+    } else {
+        &route.upstream
+    };
+
+    // 8. 路径处理：strip_prefix + path_and_query
+    let path_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or(&path)
+        .to_string();
+    let final_path = if route.strip_prefix {
+        if let Some(stripped) = path_query.strip_prefix(&route.path) {
+            if !stripped.starts_with('/') {
+                format!("/{}", stripped)
+            } else {
+                stripped.to_string()
+            }
+        } else {
+            path_query.clone()
+        }
+    } else {
+        path_query.clone()
+    };
+
+    // 9. 缓存读（GET only）
+    let cache_key = format!("{}:{}", method_str, path_query);
+    if method_str == "GET" {
+        if let Some(cached) = state.response_cache.get(&cache_key).await {
+            if Instant::now() < cached.expires_at {
+                info!("HTTP/3 Cache HIT for {}", cache_key);
+                record_metrics(&method_str, cached.status.as_str(), "cache", start);
+                let mut builder = Response::builder().status(cached.status);
+                for (k, v) in &cached.headers {
+                    builder = builder.header(k, v);
+                }
+                builder = builder.header("X-Cache", "HIT");
+                let resp_body = Full::new(cached.body).map_err(|e| match e {}).boxed();
+                return Ok(builder.body(resp_body).unwrap());
+            } else {
+                state.response_cache.remove(&cache_key).await;
+            }
+        }
+    }
+
+    // 10. 获取 upstream pool
+    let current_state_map = state.upstreams.load();
+    let upstream_state = match current_state_map.get(target_upstream_name) {
+        Some(s) => s,
+        None => {
+            error!("HTTP/3 Upstream '{}' not found", target_upstream_name);
+            record_metrics(&method_str, "500", target_upstream_name, start);
+            return Ok(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(
+                    Full::new(Bytes::from("500 Config Error"))
+                        .map_err(|e| match e {})
+                        .boxed(),
+                )
+                .unwrap());
+        }
+    };
+    let active_urls_guard = upstream_state.active_urls.load();
+    let active_urls = &**active_urls_guard;
     if active_urls.is_empty() {
+        record_metrics(&method_str, "502", target_upstream_name, start);
         return Ok(Response::builder()
-            .status(503)
-            .body(Empty::new().map_err(|e| match e {}).boxed())
+            .status(StatusCode::BAD_GATEWAY)
+            .body(
+                Full::new(Bytes::from("502 Bad Gateway (No Healthy Nodes)"))
+                    .map_err(|e| match e {})
+                    .boxed(),
+            )
             .unwrap());
     }
 
-    // 简单的轮询选择
-    let current_count = upstream_state.counter.fetch_add(1, Ordering::Relaxed);
-    let index = current_count % active_urls.len();
-    let upstream_url = &active_urls[index];
-
-    // 构建上游请求
-    let upstream_uri = format!("{}{}", upstream_url.trim_end_matches('/'), path);
-    let mut req_builder = Request::builder()
-        .method(method)
-        .uri(upstream_uri)
-        .version(hyper::Version::HTTP_11);
-
-    for (k, v) in &headers {
-        req_builder = req_builder.header(k, v);
+    // 11. X-User-Id 透传（JWT 鉴权成功后）
+    let mut req_headers = headers.clone();
+    if let Some(claim) = claims {
+        if let Ok(val) = hyper::header::HeaderValue::from_str(&claim.sub) {
+            req_headers.insert("X-User-Id", val);
+        }
     }
 
-    let upstream_req = req_builder
-        .body(Full::new(body).map_err(|e| match e {}).boxed())
-        .map_err(|e| error(format!("Failed to build request: {}", e)))?;
+    // 12. 构建上游请求（含重试、Host改写、x-forwarded-for、Tracing注入）
+    let body_full = Full::new(body);
+    let max_failover_attempts = active_urls.len();
+    let mut last_error: Option<String> = None;
 
-    // 发送请求
-    match client.request(upstream_req).await {
-        Ok(mut res) => {
-            // 注入 Alt-Svc 头
-            if let Ok(alt_svc_val) = hyper::header::HeaderValue::from_str("h3=\":8443\"; ma=86400")
-            {
-                res.headers_mut().insert("alt-svc", alt_svc_val);
+    for attempt in 0..max_failover_attempts {
+        let current_count = upstream_state.counter.fetch_add(1, Ordering::Relaxed);
+        let index = current_count % active_urls.len();
+        let upstream_url_str = &active_urls[index];
+
+        let upstream_base = match upstream_url_str.parse::<Uri>() {
+            Ok(u) => u,
+            Err(e) => {
+                error!("HTTP/3 Invalid upstream URL: {}", e);
+                continue;
             }
+        };
 
-            let res_boxed = res.map(|b: Incoming| b.map_err(|e| Box::new(e) as ProxyError).boxed());
-            Ok(res_boxed)
+        info!(
+            "HTTP/3 attempt {}/{} -> {}",
+            attempt + 1,
+            max_failover_attempts,
+            upstream_url_str
+        );
+
+        let base_str = upstream_base.to_string();
+        let base_trimmed = base_str.trim_end_matches('/');
+        let uri_string = format!("{}{}", base_trimmed, final_path);
+        let new_uri = match uri_string.parse::<Uri>() {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+
+        let mut builder = Request::builder()
+            .method(method.clone())
+            .uri(new_uri)
+            .version(hyper::Version::HTTP_11);
+        for (k, v) in &req_headers {
+            builder = builder.header(k, v);
         }
-        Err(e) => {
-            error!("HTTP/3 upstream request failed: {:?}", e);
-            Ok(Response::builder()
-                .status(502)
-                .body(Empty::new().map_err(|e| match e {}).boxed())
-                .unwrap())
+        if let Some(host) = upstream_base.host() {
+            builder = builder.header("Host", host);
+        }
+        builder = builder.header("x-forwarded-for", remote_addr.ip().to_string());
+
+        // Tracing 注入
+        let ctx = tracing::Span::current().context();
+        if let Some(hdrs) = builder.headers_mut() {
+            global::get_text_map_propagator(|propagator| {
+                propagator.inject_context(&ctx, &mut HeaderInjector(hdrs))
+            });
+        }
+
+        let retry_req = match builder.body(body_full.clone()) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        let retry_service = ServiceBuilder::new()
+            .layer(tower::retry::RetryLayer::new(ProxyRetryPolicy::new(3)))
+            .service(service_fn(|req: Request<Full<Bytes>>| {
+                let client = client.clone();
+                async move {
+                    let (parts, body) = req.into_parts();
+                    let boxed_body = body.map_err(|e| match e {}).boxed();
+                    let new_req = Request::from_parts(parts, boxed_body);
+                    client.request(new_req).await
+                }
+            }));
+
+        match retry_service.oneshot(retry_req).await {
+            Ok(mut res) => {
+                let status = res.status();
+                let status_str = status.as_u16().to_string();
+                record_metrics(&method_str, &status_str, target_upstream_name, start);
+
+                // Alt-Svc
+                if let Ok(alt_svc_val) =
+                    hyper::header::HeaderValue::from_str("h3=\":8443\"; ma=86400")
+                {
+                    res.headers_mut().insert("alt-svc", alt_svc_val);
+                }
+
+                // 13. 缓存写入（GET 2xx）
+                info!(
+                    "HTTP/3 Cache check: method={}, status={}, is_success={}",
+                    method_str,
+                    status.as_u16(),
+                    status.is_success()
+                );
+                if method_str == "GET" && status.is_success() {
+                    if let Some(max_age) = parse_cache_max_age(res.headers()) {
+                        info!("HTTP/3 Cache-Control max_age: {:?}", max_age);
+                        // 检查 cache-control 头是否存在
+                        if let Some(cc) = res.headers().get("cache-control") {
+                            info!("HTTP/3 Raw Cache-Control: {:?}", cc);
+                        } else {
+                            info!("HTTP/3 No Cache-Control header found");
+                        }
+                        let res_length = res
+                            .headers()
+                            .get(CONTENT_LENGTH)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(u64::MAX);
+                        info!("HTTP/3 Content-Length: {:?}", res_length);
+                        if res_length <= MAX_BUFFER_SIZE {
+                            let (res_parts, res_body) = res.into_parts();
+                            match res_body.collect().await {
+                                Ok(collected) => {
+                                    let body_bytes = collected.to_bytes();
+                                    let cached_res = CachedResponse {
+                                        status: res_parts.status,
+                                        headers: res_parts.headers.clone(),
+                                        body: body_bytes.clone(),
+                                        expires_at: Instant::now() + max_age,
+                                    };
+                                    state
+                                        .response_cache
+                                        .insert(cache_key.clone(), cached_res)
+                                        .await;
+                                    info!("HTTP/3 Cache WRITE for {}", cache_key);
+                                    let resp = Response::from_parts(
+                                        res_parts,
+                                        Full::new(body_bytes).map_err(|e| match e {}).boxed(),
+                                    );
+                                    return Ok(resp);
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "HTTP/3 Failed to collect response body for cache: {}",
+                                        e
+                                    );
+                                    record_metrics(&method_str, "502", target_upstream_name, start);
+                                    return Ok(Response::builder()
+                                        .status(502)
+                                        .body(Empty::new().map_err(|e| match e {}).boxed())
+                                        .unwrap());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let res_boxed =
+                    res.map(|b: Incoming| b.map_err(|e| Box::new(e) as ProxyError).boxed());
+                return Ok(res_boxed);
+            }
+            Err(e) => {
+                error!("HTTP/3 upstream attempt {} failed: {:?}", attempt + 1, e);
+                last_error = Some(format!("{:?}", e));
+            }
         }
     }
+
+    error!("HTTP/3 all upstream attempts failed: {:?}", last_error);
+    record_metrics(&method_str, "502", target_upstream_name, start);
+    Ok(Response::builder()
+        .status(502)
+        .body(
+            Full::new(Bytes::from("502 Bad Gateway"))
+                .map_err(|e| match e {})
+                .boxed(),
+        )
+        .unwrap())
 }
 
 // === 结构体定义 ===
