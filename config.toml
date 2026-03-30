@@ -74,7 +74,7 @@ path = "/api/public"
 upstream = "stable"
 strip_prefix = true
 # 默认 false，无需鉴权
-auth = false
+auth = true
 
   # === 灰度配置 ===
   [routes.canary]
