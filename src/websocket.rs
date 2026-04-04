@@ -21,7 +21,7 @@ pub fn is_websocket_request(req: &Request<Incoming>) -> bool {
         .headers()
         .get("upgrade")
         .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_ascii_lowercase() == "websocket")
+        .map(|s| s.eq_ignore_ascii_case("websocket"))
         .unwrap_or(false);
     has_connection_upgrade && has_upgrade_websocket
 }

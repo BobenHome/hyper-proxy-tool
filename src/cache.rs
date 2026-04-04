@@ -31,10 +31,10 @@ pub fn parse_cache_max_age(headers: &hyper::HeaderMap) -> Option<Duration> {
             .take_while(|c| c.is_ascii_digit())
             .collect();
 
-        if let Ok(seconds) = num_str.parse::<u64>() {
-            if seconds > 0 {
-                return Some(Duration::from_secs(seconds));
-            }
+        if let Ok(seconds) = num_str.parse::<u64>()
+            && seconds > 0
+        {
+            return Some(Duration::from_secs(seconds));
         }
     }
     None

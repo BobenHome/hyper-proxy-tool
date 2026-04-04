@@ -380,7 +380,7 @@ async fn main() -> Result<(), error::ProxyError> {
                 let inner = inner_service.clone();
                 async move {
                     let resp = match inner.oneshot(req).await {
-                        Ok(resp) => resp.map(|body| BodyExt::boxed(body)),
+                        Ok(resp) => resp.map(BodyExt::boxed),
                         Err(err) => map_tower_error_to_response(err),
                     };
                     Ok::<_, Infallible>(resp)

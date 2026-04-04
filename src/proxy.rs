@@ -1,14 +1,14 @@
-use tower::service_fn;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::header::CONTENT_LENGTH;
+use tower::service_fn;
 
 use hyper::{Method, Request, Response, StatusCode, Uri, Version};
 use rand::RngExt;
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tower::{ServiceBuilder, ServiceExt};
 use tracing::{error, info, instrument, warn};
@@ -43,26 +43,24 @@ pub async fn proxy_handler(
 
     // Health check endpoint
     if req.uri().path() == "/health" {
-        let body = Full::new(Bytes::from("OK"))
-            .map_err(|e| match e {})
-            .boxed();
+        let body = Full::new(Bytes::from("OK")).map_err(|e| match e {}).boxed();
         return Ok(Response::new(body));
     }
 
     // IP rate limiting
-    if let Some(limiter) = &**state.ip_limiter.load() {
-        if limiter.check_key(&remote_addr.ip()).is_err() {
-            warn!("IP Rate Limit Exceeded: {}", remote_addr.ip());
-            record_metrics(&method_str, "429", "ip_limit", start);
-            return Ok(Response::builder()
-                .status(StatusCode::TOO_MANY_REQUESTS)
-                .body(
-                    Full::new(Bytes::from("429 Too Many Requests (IP)"))
-                        .map_err(|e| match e {})
-                        .boxed(),
-                )
-                .unwrap());
-        }
+    if let Some(limiter) = &**state.ip_limiter.load()
+        && limiter.check_key(&remote_addr.ip()).is_err()
+    {
+        warn!("IP Rate Limit Exceeded: {}", remote_addr.ip());
+        record_metrics(&method_str, "429", "ip_limit", start);
+        return Ok(Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .body(
+                Full::new(Bytes::from("429 Too Many Requests (IP)"))
+                    .map_err(|e| match e {})
+                    .boxed(),
+            )
+            .unwrap());
     }
 
     let req_path = req.uri().path().to_string();
@@ -100,19 +98,19 @@ pub async fn proxy_handler(
 
     // Route rate limiting
     let route_limiters = state.route_limiters.load();
-    if let Some(limiter) = route_limiters.get(&route.path) {
-        if limiter.check().is_err() {
-            warn!("Route Rate Limit Exceeded: {}", route.path);
-            record_metrics(&method_str, "429", "route_limit", start);
-            return Ok(Response::builder()
-                .status(StatusCode::TOO_MANY_REQUESTS)
-                .body(
-                    Full::new(Bytes::from("429 Too Many Requests (Route)"))
-                        .map_err(|e| match e {})
-                        .boxed(),
-                )
-                .unwrap());
-        }
+    if let Some(limiter) = route_limiters.get(&route.path)
+        && limiter.check().is_err()
+    {
+        warn!("Route Rate Limit Exceeded: {}", route.path);
+        record_metrics(&method_str, "429", "route_limit", start);
+        return Ok(Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .body(
+                Full::new(Bytes::from("429 Too Many Requests (Route)"))
+                    .map_err(|e| match e {})
+                    .boxed(),
+            )
+            .unwrap());
     }
 
     // JWT auth
@@ -141,18 +139,18 @@ pub async fn proxy_handler(
 
             match plugin.run(input_json) {
                 Ok(output_json) => {
-                    if let Ok(decision) = serde_json::from_str::<WasmOutput>(&output_json) {
-                        if !decision.allow {
-                            warn!("Request blocked by Wasm plugin");
-                            return Ok(Response::builder()
-                                .status(decision.status_code)
-                                .body(
-                                    Full::new(Bytes::from(decision.body))
-                                        .map_err(|e| match e {})
-                                        .boxed(),
-                                )
-                                .unwrap());
-                        }
+                    if let Ok(decision) = serde_json::from_str::<WasmOutput>(&output_json)
+                        && !decision.allow
+                    {
+                        warn!("Request blocked by Wasm plugin");
+                        return Ok(Response::builder()
+                            .status(decision.status_code)
+                            .body(
+                                Full::new(Bytes::from(decision.body))
+                                    .map_err(|e| match e {})
+                                    .boxed(),
+                            )
+                            .unwrap());
                     }
                 }
                 Err(e) => error!("Wasm execution failed: {}", e),
@@ -179,23 +177,23 @@ pub async fn proxy_handler(
     let cache_key = format!("{}:{}", method_str, path_query);
 
     // Cache read (GET only)
-    if method_str == "GET" {
-        if let Some(cached) = state.response_cache.get(&cache_key).await {
-            if Instant::now() < cached.expires_at {
-                info!("Cache HIT for {}", cache_key);
-                record_metrics(&method_str, cached.status.as_str(), "cache", start);
+    if method_str == "GET"
+        && let Some(cached) = state.response_cache.get(&cache_key).await
+    {
+        if Instant::now() < cached.expires_at {
+            info!("Cache HIT for {}", cache_key);
+            record_metrics(&method_str, cached.status.as_str(), "cache", start);
 
-                let mut builder = Response::builder().status(cached.status);
-                for (k, v) in &cached.headers {
-                    builder = builder.header(k, v);
-                }
-                builder = builder.header("X-Cache", "HIT");
-
-                let body = Full::new(cached.body).map_err(|e| match e {}).boxed();
-                return Ok(builder.body(body).unwrap());
-            } else {
-                state.response_cache.remove(&cache_key).await;
+            let mut builder = Response::builder().status(cached.status);
+            for (k, v) in &cached.headers {
+                builder = builder.header(k, v);
             }
+            builder = builder.header("X-Cache", "HIT");
+
+            let body = Full::new(cached.body).map_err(|e| match e {}).boxed();
+            return Ok(builder.body(body).unwrap());
+        } else {
+            state.response_cache.remove(&cache_key).await;
         }
     }
     info!("Cache MISS for {}", cache_key);
@@ -280,19 +278,19 @@ pub async fn proxy_handler(
     let should_buffer = if let Some(len) = content_length {
         len <= MAX_BUFFER_SIZE
     } else {
-        match *req.method() {
-            Method::GET | Method::HEAD | Method::OPTIONS | Method::DELETE => true,
-            _ => false,
-        }
+        matches!(
+            *req.method(),
+            Method::GET | Method::HEAD | Method::OPTIONS | Method::DELETE
+        )
     };
 
     let (mut parts, body) = req.into_parts();
 
     // Inject X-User-Id header if auth succeeded
-    if let Some(claim) = claims {
-        if let Ok(val) = hyper::header::HeaderValue::from_str(&claim.sub) {
-            parts.headers.insert("X-User-Id", val);
-        }
+    if let Some(claim) = claims
+        && let Ok(val) = hyper::header::HeaderValue::from_str(&claim.sub)
+    {
+        parts.headers.insert("X-User-Id", val);
     }
 
     if should_buffer {
@@ -427,49 +425,47 @@ async fn handle_buffered_request(
                 }
 
                 // Cache write (GET 2xx)
-                if method_str == "GET" && status.is_success() {
-                    if let Some(max_age) = parse_cache_max_age(res.headers()) {
-                        let res_length = res
-                            .headers()
-                            .get(CONTENT_LENGTH)
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|v| v.parse::<u64>().ok())
-                            .unwrap_or(u64::MAX);
+                if method_str == "GET"
+                    && status.is_success()
+                    && let Some(max_age) = parse_cache_max_age(res.headers())
+                {
+                    let res_length = res
+                        .headers()
+                        .get(CONTENT_LENGTH)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(u64::MAX);
 
-                        if res_length <= MAX_BUFFER_SIZE {
-                            let (res_parts, res_body) = res.into_parts();
-                            match res_body.collect().await {
-                                Ok(collected) => {
-                                    let body_bytes = collected.to_bytes();
+                    if res_length <= MAX_BUFFER_SIZE {
+                        let (res_parts, res_body) = res.into_parts();
+                        match res_body.collect().await {
+                            Ok(collected) => {
+                                let body_bytes = collected.to_bytes();
 
-                                    let cached_res = crate::cache::CachedResponse {
-                                        status: res_parts.status,
-                                        headers: res_parts.headers.clone(),
-                                        body: body_bytes.clone(),
-                                        expires_at: Instant::now() + max_age,
-                                    };
+                                let cached_res = crate::cache::CachedResponse {
+                                    status: res_parts.status,
+                                    headers: res_parts.headers.clone(),
+                                    body: body_bytes.clone(),
+                                    expires_at: Instant::now() + max_age,
+                                };
 
-                                    state
-                                        .response_cache
-                                        .insert(cache_key.to_string(), cached_res)
-                                        .await;
+                                state
+                                    .response_cache
+                                    .insert(cache_key.to_string(), cached_res)
+                                    .await;
 
-                                    let mut builder = Response::builder().status(res_parts.status);
-                                    for (k, v) in &res_parts.headers {
-                                        builder = builder.header(k, v);
-                                    }
-                                    builder = builder.header("X-Cache", "MISS");
-
-                                    let final_body =
-                                        Full::new(body_bytes).map_err(|e| match e {}).boxed();
-                                    return Ok(builder.body(final_body).unwrap());
+                                let mut builder = Response::builder().status(res_parts.status);
+                                for (k, v) in &res_parts.headers {
+                                    builder = builder.header(k, v);
                                 }
-                                Err(_) => {
-                                    return Err(anyhow::anyhow!(
-                                        "Failed to read upstream body"
-                                    )
-                                    .into());
-                                }
+                                builder = builder.header("X-Cache", "MISS");
+
+                                let final_body =
+                                    Full::new(body_bytes).map_err(|e| match e {}).boxed();
+                                return Ok(builder.body(final_body).unwrap());
+                            }
+                            Err(_) => {
+                                return Err(anyhow::anyhow!("Failed to read upstream body").into());
                             }
                         }
                     }
@@ -656,11 +652,11 @@ pub async fn handle_http3_request(
     match resp_body.collect().await {
         Ok(collected) => {
             let data = collected.to_bytes();
-            if !data.is_empty() {
-                if let Err(e) = stream.send_data(data).await {
-                    error!("Failed to send HTTP/3 response body: {:?}", e);
-                    return;
-                }
+            if !data.is_empty()
+                && let Err(e) = stream.send_data(data).await
+            {
+                error!("Failed to send HTTP/3 response body: {:?}", e);
+                return;
             }
         }
         Err(e) => {
@@ -698,19 +694,19 @@ async fn proxy_http3_request(
     }
 
     // IP rate limiting
-    if let Some(limiter) = &**state.ip_limiter.load() {
-        if limiter.check_key(&remote_addr.ip()).is_err() {
-            warn!("HTTP/3 IP Rate Limit Exceeded: {}", remote_addr.ip());
-            record_metrics(&method_str, "429", "ip_limit", start);
-            return Ok(Response::builder()
-                .status(StatusCode::TOO_MANY_REQUESTS)
-                .body(
-                    Full::new(Bytes::from("429 Too Many Requests (IP)"))
-                        .map_err(|e| match e {})
-                        .boxed(),
-                )
-                .unwrap());
-        }
+    if let Some(limiter) = &**state.ip_limiter.load()
+        && limiter.check_key(&remote_addr.ip()).is_err()
+    {
+        warn!("HTTP/3 IP Rate Limit Exceeded: {}", remote_addr.ip());
+        record_metrics(&method_str, "429", "ip_limit", start);
+        return Ok(Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .body(
+                Full::new(Bytes::from("429 Too Many Requests (IP)"))
+                    .map_err(|e| match e {})
+                    .boxed(),
+            )
+            .unwrap());
     }
 
     // Route matching
@@ -743,19 +739,19 @@ async fn proxy_http3_request(
 
     // Route rate limiting
     let route_limiters = state.route_limiters.load();
-    if let Some(limiter) = route_limiters.get(&route.path) {
-        if limiter.check().is_err() {
-            warn!("HTTP/3 Route Rate Limit Exceeded: {}", route.path);
-            record_metrics(&method_str, "429", "route_limit", start);
-            return Ok(Response::builder()
-                .status(StatusCode::TOO_MANY_REQUESTS)
-                .body(
-                    Full::new(Bytes::from("429 Too Many Requests (Route)"))
-                        .map_err(|e| match e {})
-                        .boxed(),
-                )
-                .unwrap());
-        }
+    if let Some(limiter) = route_limiters.get(&route.path)
+        && limiter.check().is_err()
+    {
+        warn!("HTTP/3 Route Rate Limit Exceeded: {}", route.path);
+        record_metrics(&method_str, "429", "route_limit", start);
+        return Ok(Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .body(
+                Full::new(Bytes::from("429 Too Many Requests (Route)"))
+                    .map_err(|e| match e {})
+                    .boxed(),
+            )
+            .unwrap());
     }
 
     // JWT auth (inline for HTTP/3)
@@ -814,18 +810,19 @@ async fn proxy_http3_request(
             let input_json = serde_json::to_string(&input).unwrap();
             match plugin.run(input_json) {
                 Ok(output_json) => {
-                    if let Ok(decision) = serde_json::from_str::<crate::plugin::WasmOutput>(&output_json) {
-                        if !decision.allow {
-                            warn!("HTTP/3 Request blocked by Wasm plugin");
-                            return Ok(Response::builder()
-                                .status(decision.status_code)
-                                .body(
-                                    Full::new(Bytes::from(decision.body))
-                                        .map_err(|e| match e {})
-                                        .boxed(),
-                                )
-                                .unwrap());
-                        }
+                    if let Ok(decision) =
+                        serde_json::from_str::<crate::plugin::WasmOutput>(&output_json)
+                        && !decision.allow
+                    {
+                        warn!("HTTP/3 Request blocked by Wasm plugin");
+                        return Ok(Response::builder()
+                            .status(decision.status_code)
+                            .body(
+                                Full::new(Bytes::from(decision.body))
+                                    .map_err(|e| match e {})
+                                    .boxed(),
+                            )
+                            .unwrap());
                     }
                 }
                 Err(e) => error!("HTTP/3 Wasm execution failed: {}", e),
@@ -836,15 +833,15 @@ async fn proxy_http3_request(
     // Canary routing (inline)
     let target_upstream_name: &str = if let Some(canary) = &route.canary {
         let mut selected = route.upstream.as_str();
-        if let Some(key) = &canary.header_key {
-            if let Some(val) = headers.get(key) {
-                if let Some(expected_val) = &canary.header_value {
-                    if val.as_bytes() == expected_val.as_bytes() {
-                        selected = &canary.upstream;
-                    }
-                } else {
+        if let Some(key) = &canary.header_key
+            && let Some(val) = headers.get(key)
+        {
+            if let Some(expected_val) = &canary.header_value {
+                if val.as_bytes() == expected_val.as_bytes() {
                     selected = &canary.upstream;
                 }
+            } else {
+                selected = &canary.upstream;
             }
         }
         if selected == route.upstream.as_str() && canary.weight > 0 {
@@ -883,21 +880,21 @@ async fn proxy_http3_request(
 
     // Cache read (GET only)
     let cache_key = format!("{}:{}", method_str, path_query);
-    if method_str == "GET" {
-        if let Some(cached) = state.response_cache.get(&cache_key).await {
-            if Instant::now() < cached.expires_at {
-                info!("HTTP/3 Cache HIT for {}", cache_key);
-                record_metrics(&method_str, cached.status.as_str(), "cache", start);
-                let mut builder = Response::builder().status(cached.status);
-                for (k, v) in &cached.headers {
-                    builder = builder.header(k, v);
-                }
-                builder = builder.header("X-Cache", "HIT");
-                let resp_body = Full::new(cached.body).map_err(|e| match e {}).boxed();
-                return Ok(builder.body(resp_body).unwrap());
-            } else {
-                state.response_cache.remove(&cache_key).await;
+    if method_str == "GET"
+        && let Some(cached) = state.response_cache.get(&cache_key).await
+    {
+        if Instant::now() < cached.expires_at {
+            info!("HTTP/3 Cache HIT for {}", cache_key);
+            record_metrics(&method_str, cached.status.as_str(), "cache", start);
+            let mut builder = Response::builder().status(cached.status);
+            for (k, v) in &cached.headers {
+                builder = builder.header(k, v);
             }
+            builder = builder.header("X-Cache", "HIT");
+            let resp_body = Full::new(cached.body).map_err(|e| match e {}).boxed();
+            return Ok(builder.body(resp_body).unwrap());
+        } else {
+            state.response_cache.remove(&cache_key).await;
         }
     }
 
@@ -934,10 +931,10 @@ async fn proxy_http3_request(
 
     // X-User-Id injection
     let mut req_headers = headers.clone();
-    if let Some(claim) = claims {
-        if let Ok(val) = hyper::header::HeaderValue::from_str(&claim.sub) {
-            req_headers.insert("X-User-Id", val);
-        }
+    if let Some(claim) = claims
+        && let Ok(val) = hyper::header::HeaderValue::from_str(&claim.sub)
+    {
+        req_headers.insert("X-User-Id", val);
     }
 
     // Build and send upstream request
@@ -1024,43 +1021,44 @@ async fn proxy_http3_request(
                 }
 
                 // Cache write (GET 2xx)
-                if method_str == "GET" && status.is_success() {
-                    if let Some(max_age) = parse_cache_max_age(res.headers()) {
-                        let res_length = res
-                            .headers()
-                            .get(CONTENT_LENGTH)
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|v| v.parse::<u64>().ok())
-                            .unwrap_or(u64::MAX);
-                        if res_length <= MAX_BUFFER_SIZE {
-                            let (res_parts, res_body) = res.into_parts();
-                            match res_body.collect().await {
-                                Ok(collected) => {
-                                    let body_bytes = collected.to_bytes();
-                                    let cached_res = crate::cache::CachedResponse {
-                                        status: res_parts.status,
-                                        headers: res_parts.headers.clone(),
-                                        body: body_bytes.clone(),
-                                        expires_at: Instant::now() + max_age,
-                                    };
-                                    state
-                                        .response_cache
-                                        .insert(cache_key.clone(), cached_res)
-                                        .await;
-                                    let resp = Response::from_parts(
-                                        res_parts,
-                                        Full::new(body_bytes).map_err(|e| match e {}).boxed(),
-                                    );
-                                    return Ok(resp);
-                                }
-                                Err(e) => {
-                                    error!("HTTP/3 Failed to collect response body for cache: {}", e);
-                                    record_metrics(&method_str, "502", target_upstream_name, start);
-                                    return Ok(Response::builder()
-                                        .status(502)
-                                        .body(Empty::new().map_err(|e| match e {}).boxed())
-                                        .unwrap());
-                                }
+                if method_str == "GET"
+                    && status.is_success()
+                    && let Some(max_age) = parse_cache_max_age(res.headers())
+                {
+                    let res_length = res
+                        .headers()
+                        .get(CONTENT_LENGTH)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(u64::MAX);
+                    if res_length <= MAX_BUFFER_SIZE {
+                        let (res_parts, res_body) = res.into_parts();
+                        match res_body.collect().await {
+                            Ok(collected) => {
+                                let body_bytes = collected.to_bytes();
+                                let cached_res = crate::cache::CachedResponse {
+                                    status: res_parts.status,
+                                    headers: res_parts.headers.clone(),
+                                    body: body_bytes.clone(),
+                                    expires_at: Instant::now() + max_age,
+                                };
+                                state
+                                    .response_cache
+                                    .insert(cache_key.clone(), cached_res)
+                                    .await;
+                                let resp = Response::from_parts(
+                                    res_parts,
+                                    Full::new(body_bytes).map_err(|e| match e {}).boxed(),
+                                );
+                                return Ok(resp);
+                            }
+                            Err(e) => {
+                                error!("HTTP/3 Failed to collect response body for cache: {}", e);
+                                record_metrics(&method_str, "502", target_upstream_name, start);
+                                return Ok(Response::builder()
+                                    .status(502)
+                                    .body(Empty::new().map_err(|e| match e {}).boxed())
+                                    .unwrap());
                             }
                         }
                     }

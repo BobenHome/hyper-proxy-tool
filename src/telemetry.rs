@@ -15,11 +15,10 @@ pub struct HeaderInjector<'a>(pub &'a mut hyper::HeaderMap);
 
 impl<'a> Injector for HeaderInjector<'a> {
     fn set(&mut self, key: &str, value: String) {
-        if let Ok(name) = HeaderName::from_bytes(key.as_bytes()) {
-            if let Ok(val) = hyper::header::HeaderValue::from_str(&value) {
+        if let Ok(name) = HeaderName::from_bytes(key.as_bytes())
+            && let Ok(val) = hyper::header::HeaderValue::from_str(&value) {
                 self.0.insert(name, val);
             }
-        }
     }
 }
 

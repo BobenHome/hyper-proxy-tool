@@ -97,13 +97,12 @@ pub fn create_state_from_config(
     let mut route_limiters = HashMap::new();
     let mut plugins = HashMap::new();
     for route in &config.routes {
-        if let Some(limit_conf) = &route.limit {
-            if let Some(limiter) = create_route_limiter(limit_conf) {
+        if let Some(limit_conf) = &route.limit
+            && let Some(limiter) = create_route_limiter(limit_conf) {
                 route_limiters.insert(route.path.clone(), Arc::new(limiter));
             }
-        }
-        if let Some(path) = &route.plugin {
-            if !plugins.contains_key(path) {
+        if let Some(path) = &route.plugin
+            && !plugins.contains_key(path) {
                 if let Ok(module) = PluginModule::new(path) {
                     tracing::info!("Loaded Wasm plugin: {}", path);
                     plugins.insert(path.clone(), Arc::new(module));
@@ -111,7 +110,6 @@ pub fn create_state_from_config(
                     tracing::error!("Failed to load Wasm plugin: {}", path);
                 }
             }
-        }
     }
 
     // 4. JWT Key

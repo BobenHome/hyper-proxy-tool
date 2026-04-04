@@ -5,5 +5,5 @@ pub type ProxyError = Box<dyn Error + Send + Sync + 'static>;
 
 /// Create a proxy error from a message
 pub fn error<T: Into<String>>(msg: T) -> ProxyError {
-    Box::new(std::io::Error::new(std::io::ErrorKind::Other, msg.into()))
+    Box::new(std::io::Error::other(msg.into()))
 }

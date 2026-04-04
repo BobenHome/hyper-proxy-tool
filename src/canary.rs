@@ -14,17 +14,17 @@ pub fn select_target_upstream<'a>(req: &Request<Incoming>, route: &'a RouteConfi
     // 1. Check if canary config exists
     if let Some(canary) = &route.canary {
         // 2. Header match rule (highest priority)
-        if let Some(key) = &canary.header_key {
-            if let Some(val) = req.headers().get(key) {
-                // If specific value is configured, must match exactly
-                if let Some(expected_val) = &canary.header_value {
-                    if val.as_bytes() == expected_val.as_bytes() {
-                        return &canary.upstream;
-                    }
-                } else {
-                    // If no value configured, key presence is enough
+        if let Some(key) = &canary.header_key
+            && let Some(val) = req.headers().get(key)
+        {
+            // If specific value is configured, must match exactly
+            if let Some(expected_val) = &canary.header_value {
+                if val.as_bytes() == expected_val.as_bytes() {
                     return &canary.upstream;
                 }
+            } else {
+                // If no value configured, key presence is enough
+                return &canary.upstream;
             }
         }
 
