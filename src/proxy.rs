@@ -581,20 +581,13 @@ async fn handle_streaming_request(
 
 /// Handle HTTP/3 request stream
 pub async fn handle_http3_request(
-    resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
+    req: hyper::Request<()>,
+    mut stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     client: Arc<HttpClient>,
     config: Arc<arc_swap::ArcSwap<AppConfig>>,
     state: Arc<AppState>,
     remote_addr: SocketAddr,
 ) {
-    let (req, mut stream) = match resolver.resolve_request().await {
-        Ok(r) => r,
-        Err(e) => {
-            error!("Failed to resolve HTTP/3 request: {:?}", e);
-            return;
-        }
-    };
-
     // Read request body
     let mut body_bytes = bytes::BytesMut::new();
     loop {

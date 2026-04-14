@@ -14,8 +14,8 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # 默认配置
-SERVER_URL="${1:-https://localhost:8443}"
 CERTS_DIR="$(dirname "$0")"
+SERVER_URL="https://localhost:8443"
 
 # 测试计数器
 TESTS_PASSED=0
@@ -654,6 +654,33 @@ test_http3_cache() {
     fi
 }
 
+# 测试 WebTransport (HTTP/3)
+test_webtransport() {
+    print_test "测试 WebTransport over HTTP/3"
+
+    if ! command -v uv &> /dev/null; then
+        print_skip "需要 uv 来运行 WebTransport 测试"
+        return
+    fi
+
+    # 使用脚本所在目录的 test_webtransport.py
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    if [ ! -f "$SCRIPT_DIR/test_webtransport.py" ]; then
+        print_skip "未找到 test_webtransport.py"
+        return
+    fi
+
+    # 设置 SERVER_URL 环境变量并运行测试
+    if SERVER_URL="$SERVER_URL" uv run --project "$SCRIPT_DIR" python "$SCRIPT_DIR/test_webtransport.py" > /tmp/test_webtransport.log 2>&1; then
+        print_pass "WebTransport 测试通过"
+    else
+        print_fail "WebTransport 测试失败"
+        echo "--- WebTransport 测试日志 ---"
+        cat /tmp/test_webtransport.log
+        echo "-----------------------------"
+    fi
+}
+
 # 测试 WebSocket (可选)
 test_websocket() {
     print_test "测试 WebSocket 支持"
@@ -798,6 +825,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# 如果 SERVER_URL 未被显式设置，使用默认值
+if [ -z "$SERVER_URL" ]; then
+    SERVER_URL="https://localhost:8443"
+fi
+
 # 主函数
 main() {
     print_header "hyper-proxy-tool 测试套件"
@@ -849,6 +881,7 @@ main() {
     test_http3_jwt_auth
     test_http3_canary
     test_http3_cache
+    test_webtransport
 
     # 打印摘要
     print_summary

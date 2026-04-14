@@ -42,6 +42,7 @@ mod state;
 mod telemetry;
 mod tls;
 mod websocket;
+mod webtransport;
 
 use crate::config::{Cli, load_config};
 use crate::metrics::{ConnectionGuard, init_metrics};
@@ -278,6 +279,9 @@ async fn main() -> Result<(), error::ProxyError> {
                 let h3_conn = H3QuinnConnection::new(connection);
 
                 let mut h3_server_conn = match h3::server::builder()
+                    .enable_webtransport(true)
+                    .enable_extended_connect(true)
+                    .enable_datagram(true)
                     .build::<_, bytes::Bytes>(h3_conn)
                     .await
                 {
@@ -291,20 +295,49 @@ async fn main() -> Result<(), error::ProxyError> {
                 loop {
                     match h3_server_conn.accept().await {
                         Ok(Some(resolver)) => {
-                            let client = client.clone();
-                            let config = config.clone();
-                            let state = state.clone();
+                            let (req, stream) = match resolver.resolve_request().await {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    error!("Failed to resolve HTTP/3 request: {:?}", e);
+                                    continue;
+                                }
+                            };
 
-                            tokio::spawn(async move {
-                                proxy::handle_http3_request(
-                                    resolver,
-                                    client,
-                                    config,
-                                    state,
-                                    remote_addr,
-                                )
-                                .await;
-                            });
+                            if webtransport::is_webtransport_request(&req) {
+                                let client = client.clone();
+                                let state = state.clone();
+                                // WebTransport consumes the h3_server_conn, so we break the loop
+                                tokio::spawn(async move {
+                                    if let Err(e) = webtransport::handle_webtransport_session(
+                                        req,
+                                        stream,
+                                        client,
+                                        state,
+                                        remote_addr,
+                                        h3_server_conn,
+                                    )
+                                    .await
+                                    {
+                                        error!("WebTransport session error: {:?}", e);
+                                    }
+                                });
+                                break;
+                            } else {
+                                let client = client.clone();
+                                let config = config.clone();
+                                let state = state.clone();
+                                tokio::spawn(async move {
+                                    proxy::handle_http3_request(
+                                        req,
+                                        stream,
+                                        client,
+                                        config,
+                                        state,
+                                        remote_addr,
+                                    )
+                                    .await;
+                                });
+                            }
                         }
                         Ok(None) => {
                             info!("HTTP/3 connection closed gracefully from {:?}", remote_addr);

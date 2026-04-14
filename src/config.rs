@@ -69,6 +69,8 @@ pub struct RouteConfig {
     pub auth: bool,
     pub canary: Option<CanaryConfig>,
     pub plugin: Option<String>,
+    #[serde(default)]
+    pub webtransport: bool,
 }
 
 /// Rate limit configuration
@@ -88,8 +90,8 @@ pub struct Cli {
 
 /// Load configuration from file
 pub fn load_config(path: &str) -> Result<AppConfig, ProxyError> {
-    let config_content =
-        fs::read_to_string(path).map_err(|e| crate::error::error(format!("Failed to read config file: {}", e)))?;
+    let config_content = fs::read_to_string(path)
+        .map_err(|e| crate::error::error(format!("Failed to read config file: {}", e)))?;
     let config: AppConfig = toml::from_str(&config_content)
         .map_err(|e| crate::error::error(format!("Failed to parse config TOML: {}", e)))?;
     Ok(config)

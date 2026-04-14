@@ -1,0 +1,9 @@
+[project]
+name = "hyper-proxy-tool"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aioquic>=1.3.0",
+]
