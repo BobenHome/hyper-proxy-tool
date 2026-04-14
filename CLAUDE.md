@@ -28,7 +28,7 @@ cargo test
 # Run a single test
 cargo test <test_name>
 
-# Run the full integration test suite (includes HTTP/3 tests)
+# Run the full integration test suite (includes HTTP/3 and WebTransport tests)
 ./test.sh
 
 # Run tests against an already running server
@@ -36,6 +36,9 @@ cargo test <test_name>
 
 # Run tests and stop server afterward
 ./test.sh --stop
+
+# Run WebTransport test standalone
+uv run python test_webtransport.py
 ```
 
 ### Lint / Check
@@ -127,12 +130,15 @@ On `config.toml` change, the file watcher triggers a full reload: config, upstre
 - **HTTP/1.1** — TCP port (default 8443), full feature support
 - **HTTP/2** — TCP port (default 8443), negotiated via ALPN, full feature support
 - **HTTP/3** — UDP port (default 8443), QUIC transport, full feature support
+- **WebTransport** — over HTTP/3, handled in `webtransport.rs`; `main.rs` detects `CONNECT` requests with `:protocol = webtransport` and delegates to `handle_webtransport_session()`
+
+**Note:** The QUIC endpoint binds to `0.0.0.0` (IPv4 only). When testing with curl or Python scripts, use `127.0.0.1` instead of `localhost` to avoid IPv6 connection failures.
 
 ### Wasm Plugins
 
 `plugin::PluginModule` wraps a compiled `wasmtime` module. Plugins receive request metadata (method, path, headers as JSON) via WASI stdin and return a decision JSON (allow/block + status + body) via stdout.
 
-## Testing HTTP/3
+## Testing HTTP/3 and WebTransport
 
 ```bash
 # Start the server
@@ -143,4 +149,13 @@ curl -v --http3 -k https://127.0.0.1:8443/health
 
 # Test HTTP/2 with Alt-Svc header
 curl -I --http2 -k https://127.0.0.1:8443/api/public/get | grep alt-svc
+
+# Test WebTransport over HTTP/3
+uv run python test_webtransport.py
 ```
+
+### WebTransport Implementation Notes
+
+- `test_webtransport.py` uses `aioquic` to perform an Extended CONNECT handshake and then opens a bidirectional WebTransport stream.
+- The server echoes back any data received on the stream.
+- Because `h3-webtransport` echoes raw payload without re-adding the WebTransport frame header, the Python client intercepts `StreamDataReceived` QUIC events directly rather than relying on `H3Connection`'s frame parser for the echo response.
