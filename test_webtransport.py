@@ -172,7 +172,7 @@ async def test_webtransport() -> bool:
                 response_status = int(status_bytes) if status_bytes else None
                 print(f"[INFO] 收到响应: HTTP {response_status}")
             elif isinstance(event, DataReceived):
-                print(f"[INFO] 收到数据: {event.data}")
+                print(f"[INFO] 收到数据: {event.data!r}")
 
         if response_status != 200:
             print(f"[FAIL] WebTransport 握手失败，状态码: {response_status}")
