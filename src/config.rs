@@ -45,6 +45,12 @@ pub struct TracingConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct UpstreamConfig {
     pub urls: Vec<String>,
+    #[serde(default = "default_health_check")]
+    pub health_check: bool,
+}
+
+fn default_health_check() -> bool {
+    true
 }
 
 /// Canary configuration for gradual rollout

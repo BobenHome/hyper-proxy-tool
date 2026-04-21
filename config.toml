@@ -32,7 +32,8 @@ endpoint = "http://localhost:4317"
 [upstreams]
   # 稳定版集群
   [upstreams.stable]
-  urls = ["https://httpbin.org"]
+  urls = ["https://127.0.0.1:9443"]
+  health_check = false
 
   # 灰度版集群 (为了演示，可以用 postman-echo 或者另一个 httpbin)
   [upstreams.canary]
@@ -75,6 +76,7 @@ upstream = "stable"
 strip_prefix = true
 # 默认 false，无需鉴权
 auth = true
+webtransport = true
 
   # === 灰度配置 ===
   [routes.canary]

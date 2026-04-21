@@ -39,6 +39,9 @@ cargo test <test_name>
 
 # Run WebTransport test standalone
 uv run python test_webtransport.py
+
+# Run local WebTransport echo upstream (for proxy WT forwarding tests)
+uv run python test_wt_upstream.py
 ```
 
 ### Lint / Check
@@ -57,7 +60,7 @@ cargo modules structure
 
 ## Architecture
 
-The project follows a modular architecture with 14 source files under `src/`:
+The project follows a modular architecture with 15 source files under `src/`:
 
 ### Module Organization
 
@@ -154,8 +157,14 @@ curl -I --http2 -k https://127.0.0.1:8443/api/public/get | grep alt-svc
 uv run python test_webtransport.py
 ```
 
-### WebTransport Implementation Notes
+### WebTransport Testing Setup
 
-- `test_webtransport.py` uses `aioquic` to perform an Extended CONNECT handshake and then opens a bidirectional WebTransport stream.
+**Client test (`test_webtransport.py`):**
+- Uses `aioquic` to perform an Extended CONNECT handshake and then opens a bidirectional WebTransport stream.
 - The server echoes back any data received on the stream.
 - Because `h3-webtransport` echoes raw payload without re-adding the WebTransport frame header, the Python client intercepts `StreamDataReceived` QUIC events directly rather than relying on `H3Connection`'s frame parser for the echo response.
+
+**Local upstream (`test_wt_upstream.py`):**
+- A standalone WebTransport echo server (runs on port 9443 by default) for testing the proxy's WebTransport forwarding to an upstream.
+- Requires `cert.pem` and `key.pem` in the repo root (generate with `openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes -subj '/CN=localhost'`).
+- Start it before the proxy when testing end-to-end WebTransport proxying.

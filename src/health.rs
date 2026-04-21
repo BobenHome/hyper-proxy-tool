@@ -35,6 +35,17 @@ pub async fn start_health_check_loop(
 
         for (name, upstream_config) in &current_config.upstreams {
             if let Some(upstream_state) = current_state_map.get(name) {
+                // Skip health check if disabled for this upstream
+                if !upstream_config.health_check {
+                    let all_urls: Vec<String> = upstream_config.urls.clone();
+                    let current = upstream_state.active_urls.load();
+                    if current.len() != all_urls.len() {
+                        info!("Upstream '{}' health check disabled, marking all nodes healthy", name);
+                        upstream_state.active_urls.store(Arc::new(all_urls));
+                    }
+                    continue;
+                }
+
                 let mut healthy_urls = Vec::new();
                 for url in &upstream_config.urls {
                     if check_upstream(&client, url).await {

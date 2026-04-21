@@ -78,6 +78,9 @@ h3 = "0.0.8"
 h3-quinn = { version = "0.0.10", features = ["datagram"] }
 h3-webtransport = "0.1.2"
 
+# WebTransport 客户端库（用于连接上游 WT 服务）
+wtransport = { version = "0.7", features = ["aws-lc-rs", "dangerous-configuration"] }
+
 # === 性能优化：替换全局内存分配器 ===
 # 只在非 Windows 环境下引入 jemalloc
 [target.'cfg(not(target_env = "msvc"))'.dependencies]

@@ -306,6 +306,7 @@ async fn main() -> Result<(), error::ProxyError> {
                             if webtransport::is_webtransport_request(&req) {
                                 let client = client.clone();
                                 let state = state.clone();
+                                let config = config.clone();
                                 // WebTransport consumes the h3_server_conn, so we break the loop
                                 tokio::spawn(async move {
                                     if let Err(e) = webtransport::handle_webtransport_session(
@@ -313,6 +314,7 @@ async fn main() -> Result<(), error::ProxyError> {
                                         stream,
                                         client,
                                         state,
+                                        config,
                                         remote_addr,
                                         h3_server_conn,
                                     )
