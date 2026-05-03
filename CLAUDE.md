@@ -160,11 +160,13 @@ uv run python test_webtransport.py
 ### WebTransport Testing Setup
 
 **Client test (`test_webtransport.py`):**
+
 - Uses `aioquic` to perform an Extended CONNECT handshake and then opens a bidirectional WebTransport stream.
 - The server echoes back any data received on the stream.
 - Because `h3-webtransport` echoes raw payload without re-adding the WebTransport frame header, the Python client intercepts `StreamDataReceived` QUIC events directly rather than relying on `H3Connection`'s frame parser for the echo response.
 
 **Local upstream (`test_wt_upstream.py`):**
+
 - A standalone WebTransport echo server (runs on port 9443 by default) for testing the proxy's WebTransport forwarding to an upstream.
 - Requires `cert.pem` and `key.pem` in the repo root (generate with `openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes -subj '/CN=localhost'`).
 - Start it before the proxy when testing end-to-end WebTransport proxying.
