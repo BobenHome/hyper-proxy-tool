@@ -97,31 +97,6 @@ async fn proxy_bidi_stream(
     }
 }
 
-/// Echo data back on a single bidirectional stream (fallback when no upstream).
-async fn echo_bidi_stream(
-    mut bidi_stream: h3_webtransport::stream::BidiStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-) {
-    let mut buf = [0u8; 1024];
-    loop {
-        match tokio::io::AsyncReadExt::read(&mut bidi_stream, &mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                if let Err(e) =
-                    tokio::io::AsyncWriteExt::write_all(&mut bidi_stream, &buf[..n]).await
-                {
-                    error!("Echo stream write error: {:?}", e);
-                    break;
-                }
-            }
-            Err(e) => {
-                error!("Echo stream read error: {:?}", e);
-                break;
-            }
-        }
-    }
-    let _ = tokio::io::AsyncWriteExt::shutdown(&mut bidi_stream).await;
-}
-
 /// Handle WebTransport session over HTTP/3 with upstream proxying.
 pub async fn handle_webtransport_session(
     req: Request<()>,
@@ -187,7 +162,33 @@ pub async fn handle_webtransport_session(
         path, route.upstream, upstream_url
     );
 
-    // 3. Accept the client WebTransport session
+    // 3. Connect to upstream before accepting the client session. If the proxy target is
+    // unavailable, fail the handshake instead of returning a successful echo session.
+    let upstream_conn = match connect_upstream(&upstream_url).await {
+        Ok(conn) => {
+            info!(
+                "WebTransport upstream connection established to {}",
+                upstream_url
+            );
+            conn
+        }
+        Err(e) => {
+            warn!(
+                "Failed to connect upstream WebTransport ({}): {:?}",
+                upstream_url, e
+            );
+            let mut error_stream = stream;
+            let error_resp = Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(())
+                .unwrap();
+            let _ = error_stream.send_response(error_resp).await;
+            let _ = error_stream.finish().await;
+            return Ok(());
+        }
+    };
+
+    // 4. Accept the client WebTransport session
     let session =
         match h3_webtransport::server::WebTransportSession::accept(req, stream, h3_server_conn)
             .await
@@ -201,52 +202,27 @@ pub async fn handle_webtransport_session(
 
     info!("WebTransport client session established");
 
-    // 4. Connect to upstream WebTransport server (with fallback to echo)
-    let upstream_conn = match connect_upstream(&upstream_url).await {
-        Ok(conn) => {
-            info!(
-                "WebTransport upstream connection established to {}",
-                upstream_url
-            );
-            Some(conn)
-        }
-        Err(e) => {
-            warn!(
-                "Failed to connect upstream WebTransport ({}), falling back to echo mode: {:?}",
-                upstream_url, e
-            );
-            None
-        }
-    };
-
-    // 5. Handle streams: proxy to upstream if available, otherwise echo
+    // 5. Handle streams through the configured upstream.
     loop {
         match session.accept_bi().await {
             Ok(Some(h3_webtransport::server::AcceptedBi::BidiStream(_session_id, bidi_stream))) => {
-                if let Some(ref upstream_conn) = upstream_conn {
-                    let upstream_stream = match upstream_conn.open_bi().await {
-                        Ok(opening) => match opening.await {
-                            Ok((send, recv)) => wtransport::stream::BiStream::join((send, recv)),
-                            Err(e) => {
-                                error!("Failed to open upstream bidi stream: {:?}", e);
-                                continue;
-                            }
-                        },
+                let upstream_stream = match upstream_conn.open_bi().await {
+                    Ok(opening) => match opening.await {
+                        Ok((send, recv)) => wtransport::stream::BiStream::join((send, recv)),
                         Err(e) => {
-                            error!("Failed to initiate upstream bidi stream: {:?}", e);
+                            error!("Failed to open upstream bidi stream: {:?}", e);
                             continue;
                         }
-                    };
+                    },
+                    Err(e) => {
+                        error!("Failed to initiate upstream bidi stream: {:?}", e);
+                        continue;
+                    }
+                };
 
-                    tokio::spawn(async move {
-                        proxy_bidi_stream(bidi_stream, upstream_stream).await;
-                    });
-                } else {
-                    // Fallback: echo mode
-                    tokio::spawn(async move {
-                        echo_bidi_stream(bidi_stream).await;
-                    });
-                }
+                tokio::spawn(async move {
+                    proxy_bidi_stream(bidi_stream, upstream_stream).await;
+                });
             }
             Ok(Some(h3_webtransport::server::AcceptedBi::Request(_req, _stream))) => {
                 info!("Received additional request in WebTransport session");
