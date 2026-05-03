@@ -31,17 +31,12 @@ pub async fn handle_websocket(
     req: Request<Incoming>,
     client: Arc<HttpClient>,
     upstream_base: Uri,
+    final_path: &str,
 ) -> Result<Response<http_body_util::combinators::BoxBody<Bytes, ProxyError>>, ProxyError> {
     tracing::info!("Detected WebSocket upgrade request");
-    let path = req.uri().path();
-    let path_query = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or(path);
     let base_str = upstream_base.to_string();
     let base_trimmed = base_str.trim_end_matches('/');
-    let uri_string = format!("{}{}", base_trimmed, path_query);
+    let uri_string = format!("{}{}", base_trimmed, final_path);
     let new_uri = uri_string.parse::<Uri>()?;
 
     let mut upstream_req_builder = Request::builder()
@@ -55,8 +50,8 @@ pub async fn handle_websocket(
         upstream_req_builder = upstream_req_builder.header("Host", host);
     }
 
-    let upstream_req = upstream_req_builder
-        .body(Empty::<Bytes>::new().map_err(|e| match e {}).boxed())?;
+    let upstream_req =
+        upstream_req_builder.body(Empty::<Bytes>::new().map_err(|e| match e {}).boxed())?;
     let res = client.request(upstream_req).await?;
 
     if res.status() == StatusCode::SWITCHING_PROTOCOLS {
@@ -65,8 +60,8 @@ pub async fn handle_websocket(
         for (k, v) in res.headers() {
             client_res_builder = client_res_builder.header(k, v);
         }
-        let client_res = client_res_builder
-            .body(Empty::<Bytes>::new().map_err(|e| match e {}).boxed())?;
+        let client_res =
+            client_res_builder.body(Empty::<Bytes>::new().map_err(|e| match e {}).boxed())?;
 
         // Spawn task to handle bidirectional copy
         tokio::spawn(async move {

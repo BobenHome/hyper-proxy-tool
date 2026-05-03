@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::body::Incoming;
-use hyper::header::CONTENT_LENGTH;
+use hyper::header::{AUTHORIZATION, CONTENT_LENGTH};
 use tower::service_fn;
 
 use hyper::{Method, Request, Response, StatusCode, Uri, Version};
@@ -27,6 +27,39 @@ use crate::telemetry::HeaderInjector;
 use crate::websocket::{handle_websocket, is_websocket_request};
 
 const MAX_BUFFER_SIZE: u64 = 64 * 1024;
+
+fn path_matches_route(path: &str, route_path: &str) -> bool {
+    path == route_path
+        || path
+            .strip_prefix(route_path)
+            .map(|rest| rest.starts_with('/'))
+            .unwrap_or(false)
+}
+
+fn find_matching_route<'a>(path: &str, routes: &'a [RouteConfig]) -> Option<&'a RouteConfig> {
+    routes
+        .iter()
+        .filter(|route| path_matches_route(path, &route.path))
+        .max_by_key(|route| route.path.len())
+}
+
+fn strip_route_prefix(path_query: &str, route: &RouteConfig) -> String {
+    if route.strip_prefix {
+        if let Some(stripped) = path_query.strip_prefix(&route.path) {
+            if !stripped.starts_with('/') {
+                format!("/{}", stripped)
+            } else if stripped.is_empty() {
+                "/".to_string()
+            } else {
+                stripped.to_string()
+            }
+        } else {
+            path_query.to_string()
+        }
+    } else {
+        path_query.to_string()
+    }
+}
 
 /// Main proxy handler for HTTP/1.1 and HTTP/2
 #[instrument(skip(client, config, state, req), fields(method = %req.method(), uri = %req.uri()))]
@@ -67,13 +100,7 @@ pub async fn proxy_handler(
     let current_config = config.load();
 
     // Route matching
-    let mut matched_route: Option<&RouteConfig> = None;
-    for route in &current_config.routes {
-        if req_path.starts_with(&route.path) {
-            matched_route = Some(route);
-            break;
-        }
-    }
+    let matched_route = find_matching_route(&req_path, &current_config.routes);
 
     let upstream_name = matched_route
         .map(|r| r.upstream.as_str())
@@ -173,11 +200,15 @@ pub async fn proxy_handler(
         .unwrap_or(&req_path)
         .to_string();
 
+    let final_path = strip_route_prefix(&path_query, route);
+    let request_has_auth = route.auth || req.headers().contains_key(AUTHORIZATION);
+
     // Cache key
-    let cache_key = format!("{}:{}", method_str, path_query);
+    let cache_key = format!("{}:{}:{}", target_upstream_name, method_str, path_query);
 
     // Cache read (GET only)
-    if method_str == "GET"
+    if !request_has_auth
+        && method_str == "GET"
         && let Some(cached) = state.response_cache.get(&cache_key).await
     {
         if Instant::now() < cached.expires_at {
@@ -250,23 +281,8 @@ pub async fn proxy_handler(
         };
 
         info!("WebSocket LB -> {}", upstream_url_str);
-        return handle_websocket(req, client, upstream_base).await;
+        return handle_websocket(req, client, upstream_base, &final_path).await;
     }
-
-    // Path stripping
-    let final_path = if route.strip_prefix {
-        if let Some(stripped) = path_query.strip_prefix(&route.path) {
-            if !stripped.starts_with('/') {
-                format!("/{}", stripped)
-            } else {
-                stripped.to_string()
-            }
-        } else {
-            path_query.clone()
-        }
-    } else {
-        path_query.clone()
-    };
 
     // Determine buffering strategy
     let content_length = req
@@ -306,6 +322,7 @@ pub async fn proxy_handler(
             remote_addr,
             &method_str,
             &cache_key,
+            request_has_auth,
             start,
         )
         .await
@@ -338,6 +355,7 @@ async fn handle_buffered_request(
     remote_addr: SocketAddr,
     method_str: &str,
     cache_key: &str,
+    request_has_auth: bool,
     start: Instant,
 ) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError> {
     let body_bytes = body.collect().await?.to_bytes();
@@ -425,7 +443,8 @@ async fn handle_buffered_request(
                 }
 
                 // Cache write (GET 2xx)
-                if method_str == "GET"
+                if !request_has_auth
+                    && method_str == "GET"
                     && status.is_success()
                     && let Some(max_age) = parse_cache_max_age(res.headers())
                 {
@@ -596,6 +615,16 @@ pub async fn handle_http3_request(
                 use bytes::Buf;
                 while data.remaining() > 0 {
                     let chunk = data.copy_to_bytes(data.remaining());
+                    if body_bytes.len() + chunk.len() > MAX_BUFFER_SIZE as usize {
+                        warn!("HTTP/3 request body too large");
+                        let error_resp = Response::builder()
+                            .status(StatusCode::PAYLOAD_TOO_LARGE)
+                            .body(())
+                            .unwrap();
+                        let _ = stream.send_response(error_resp).await;
+                        let _ = stream.finish().await;
+                        return;
+                    }
                     body_bytes.extend_from_slice(&chunk);
                 }
             }
@@ -642,19 +671,22 @@ pub async fn handle_http3_request(
         return;
     }
 
-    match resp_body.collect().await {
-        Ok(collected) => {
-            let data = collected.to_bytes();
-            if !data.is_empty()
-                && let Err(e) = stream.send_data(data).await
-            {
-                error!("Failed to send HTTP/3 response body: {:?}", e);
+    let mut resp_body = resp_body;
+    while let Some(frame_result) = resp_body.frame().await {
+        match frame_result {
+            Ok(frame) => {
+                if let Ok(data) = frame.into_data()
+                    && !data.is_empty()
+                    && let Err(e) = stream.send_data(data).await
+                {
+                    error!("Failed to send HTTP/3 response body: {:?}", e);
+                    return;
+                }
+            }
+            Err(e) => {
+                error!("Failed to read HTTP/3 response body: {:?}", e);
                 return;
             }
-        }
-        Err(e) => {
-            error!("Failed to collect HTTP/3 response body: {:?}", e);
-            return;
         }
     }
 
@@ -704,13 +736,7 @@ async fn proxy_http3_request(
 
     // Route matching
     let current_config = config.load();
-    let mut matched_route: Option<&RouteConfig> = None;
-    for route in &current_config.routes {
-        if path.starts_with(&route.path) {
-            matched_route = Some(route);
-            break;
-        }
-    }
+    let matched_route = find_matching_route(&path, &current_config.routes);
     let upstream_name = matched_route
         .map(|r| r.upstream.as_str())
         .unwrap_or("unknown");
@@ -857,23 +883,13 @@ async fn proxy_http3_request(
         .map(|pq| pq.as_str())
         .unwrap_or(&path)
         .to_string();
-    let final_path = if route.strip_prefix {
-        if let Some(stripped) = path_query.strip_prefix(&route.path) {
-            if !stripped.starts_with('/') {
-                format!("/{}", stripped)
-            } else {
-                stripped.to_string()
-            }
-        } else {
-            path_query.clone()
-        }
-    } else {
-        path_query.clone()
-    };
+    let final_path = strip_route_prefix(&path_query, route);
 
     // Cache read (GET only)
-    let cache_key = format!("{}:{}", method_str, path_query);
-    if method_str == "GET"
+    let request_has_auth = route.auth || headers.contains_key(AUTHORIZATION);
+    let cache_key = format!("{}:{}:{}", target_upstream_name, method_str, path_query);
+    if !request_has_auth
+        && method_str == "GET"
         && let Some(cached) = state.response_cache.get(&cache_key).await
     {
         if Instant::now() < cached.expires_at {
@@ -1014,7 +1030,8 @@ async fn proxy_http3_request(
                 }
 
                 // Cache write (GET 2xx)
-                if method_str == "GET"
+                if !request_has_auth
+                    && method_str == "GET"
                     && status.is_success()
                     && let Some(max_age) = parse_cache_max_age(res.headers())
                 {
