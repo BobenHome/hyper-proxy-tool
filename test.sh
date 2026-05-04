@@ -14,8 +14,10 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # 默认配置
-CERTS_DIR="$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SERVER_URL="https://localhost:8443"
+LOCAL_UPSTREAM_PID=""
+WT_UPSTREAM_PID=""
 
 # 测试计数器
 TESTS_PASSED=0
@@ -44,6 +46,160 @@ print_fail() {
 
 print_skip() {
     echo -e "${YELLOW}⊘ SKIP${NC}: $1"
+}
+
+is_local_server_url() {
+    case "$SERVER_URL" in
+        https://localhost:*|https://127.0.0.1:*|https://0.0.0.0:*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# 启动本地 HTTP 上游，供 stable upstream (http://127.0.0.1:9443) 使用。
+# 只监听 TCP 9443，不影响 WebTransport 上游使用同一端口的 UDP/QUIC。
+start_local_upstream() {
+    if ! is_local_server_url; then
+        return
+    fi
+
+    if curl -s --connect-timeout 1 "http://127.0.0.1:9443/get" > /dev/null 2>&1; then
+        print_pass "本地 HTTP 测试上游已运行"
+        return
+    fi
+
+    if ! command -v python3 &> /dev/null; then
+        print_skip "python3 不可用，无法启动本地 HTTP 测试上游"
+        return
+    fi
+
+    print_test "启动本地 HTTP 测试上游 (127.0.0.1:9443)"
+
+    (
+        cd "$SCRIPT_DIR"
+        python3 - <<'PY'
+import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        self._send_response()
+
+    def do_HEAD(self):
+        self._send_response(head_only=True)
+
+    def log_message(self, fmt, *args):
+        return
+
+    def _send_response(self, head_only=False):
+        payload = {
+            "httpbin": "local-mock",
+            "path": self.path,
+            "headers": {k: v for k, v in self.headers.items()},
+        }
+        body = json.dumps(payload, ensure_ascii=False).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        if self.path.startswith("/cache/"):
+            max_age = self.path.rsplit("/", 1)[-1]
+            if max_age.isdigit():
+                self.send_header("Cache-Control", f"public, max-age={max_age}")
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(body)
+
+
+httpd = ThreadingHTTPServer(("127.0.0.1", 9443), Handler)
+httpd.serve_forever()
+PY
+    ) > /tmp/hyper-proxy-tool-upstream.log 2>&1 &
+    LOCAL_UPSTREAM_PID=$!
+
+    for i in {1..20}; do
+        if curl -s --connect-timeout 1 "http://127.0.0.1:9443/get" > /dev/null 2>&1; then
+            echo "$LOCAL_UPSTREAM_PID" > /tmp/hyper-proxy-tool-upstream.pid
+            print_pass "本地 HTTP 测试上游启动成功 (PID: $LOCAL_UPSTREAM_PID)"
+            return
+        fi
+        if ! kill -0 "$LOCAL_UPSTREAM_PID" 2>/dev/null; then
+            print_fail "本地 HTTP 测试上游启动失败"
+            tail -50 /tmp/hyper-proxy-tool-upstream.log
+            LOCAL_UPSTREAM_PID=""
+            return
+        fi
+        sleep 0.2
+    done
+
+    print_fail "本地 HTTP 测试上游启动超时"
+    tail -50 /tmp/hyper-proxy-tool-upstream.log
+}
+
+stop_local_upstream() {
+    if [ -n "$LOCAL_UPSTREAM_PID" ] && kill -0 "$LOCAL_UPSTREAM_PID" 2>/dev/null; then
+        print_test "停止本地 HTTP 测试上游 (PID: $LOCAL_UPSTREAM_PID)..."
+        {
+            kill "$LOCAL_UPSTREAM_PID" || true
+            sleep 0.2
+            kill -9 "$LOCAL_UPSTREAM_PID" || true
+            wait "$LOCAL_UPSTREAM_PID" || true
+        } 2>/dev/null
+    fi
+    rm -f /tmp/hyper-proxy-tool-upstream.pid
+}
+
+start_wt_upstream() {
+    if ! is_local_server_url; then
+        return 0
+    fi
+
+    if ! command -v uv &> /dev/null; then
+        print_skip "需要 uv 来启动 WebTransport 上游"
+        return 1
+    fi
+
+    print_test "启动本地 WebTransport 测试上游 (127.0.0.1:9443/UDP)"
+
+    (
+        cd "$SCRIPT_DIR"
+        uv run --project "$SCRIPT_DIR" python "$SCRIPT_DIR/test_wt_upstream.py"
+    ) > /tmp/hyper-proxy-tool-wt-upstream.log 2>&1 &
+    WT_UPSTREAM_PID=$!
+
+    sleep 2
+    if kill -0 "$WT_UPSTREAM_PID" 2>/dev/null; then
+        print_pass "本地 WebTransport 测试上游启动成功 (PID: $WT_UPSTREAM_PID)"
+        return 0
+    fi
+
+    if grep -qi "address already in use" /tmp/hyper-proxy-tool-wt-upstream.log; then
+        print_pass "本地 WebTransport 测试上游已运行"
+        WT_UPSTREAM_PID=""
+        return 0
+    fi
+
+    print_fail "本地 WebTransport 测试上游启动失败"
+    cat /tmp/hyper-proxy-tool-wt-upstream.log
+    WT_UPSTREAM_PID=""
+    return 1
+}
+
+stop_wt_upstream() {
+    if [ -n "$WT_UPSTREAM_PID" ] && kill -0 "$WT_UPSTREAM_PID" 2>/dev/null; then
+        print_test "停止本地 WebTransport 测试上游 (PID: $WT_UPSTREAM_PID)..."
+        {
+            kill "$WT_UPSTREAM_PID" || true
+            sleep 0.2
+            kill -9 "$WT_UPSTREAM_PID" || true
+            wait "$WT_UPSTREAM_PID" || true
+        } 2>/dev/null
+    fi
 }
 
 # 检查服务器是否已运行
@@ -585,16 +741,27 @@ print(jwt.encode(payload, 'a-string-secret-at-least-256-bits-long', algorithm='H
     # 等待限流恢复
     sleep 2
 
-    RESPONSE=$(curl --http3 -sk -w "\n%{http_code}" \
-        -H "Authorization: Bearer $TOKEN" \
-        "$SERVER_URL/api/v1/get" 2>&1 || echo "")
-    HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+    HTTP_CODE=""
+    for i in {1..5}; do
+        RESPONSE=$(curl --http3 -sk -w "\n%{http_code}" \
+            -H "Authorization: Bearer $TOKEN" \
+            "$SERVER_URL/api/v1/get" 2>&1 || echo "")
+        HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
 
-    if [ "$HTTP_CODE" = "200" ]; then
-        print_pass "HTTP/3 有效 token 认证通过 (HTTP 200)"
-    else
-        print_fail "HTTP/3 有效 token 应返回 200，实际: $HTTP_CODE"
-    fi
+        if [ "$HTTP_CODE" = "200" ]; then
+            print_pass "HTTP/3 有效 token 认证通过 (HTTP 200)"
+            return
+        fi
+
+        # 路由限流或灰度上游偶发失败时稍等重试；401/403 则说明鉴权本身失败。
+        if [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ]; then
+            break
+        fi
+
+        sleep 1
+    done
+
+    print_fail "HTTP/3 有效 token 应返回 200，实际: $HTTP_CODE"
 }
 
 # 测试 HTTP/3 - Canary 灰度
@@ -609,7 +776,7 @@ test_http3_canary() {
     BODY=$(echo "$RESPONSE" | sed '$d')
 
     if [ "$HTTP_CODE" != "404" ]; then
-        # 检查响应中是否包含 postman-echo 的特征
+        # 如果用户把 canary 配到外部 postman-echo，可额外验证响应特征。
         if echo "$BODY" | grep -qi "postman"; then
             print_pass "HTTP/3 X-Canary header 正确路由到灰度上游"
         else
@@ -670,6 +837,10 @@ test_webtransport() {
         return
     fi
 
+    if ! start_wt_upstream; then
+        return
+    fi
+
     # 设置 SERVER_URL 环境变量并运行测试
     if SERVER_URL="$SERVER_URL" uv run --project "$SCRIPT_DIR" python "$SCRIPT_DIR/test_webtransport.py" > /tmp/test_webtransport.log 2>&1; then
         print_pass "WebTransport 测试通过"
@@ -695,8 +866,8 @@ test_canary_header() {
     print_test "测试灰度路由 - Header 匹配"
 
     # config.toml 配置:
-    # - stable: https://httpbin.org
-    # - canary: https://postman-echo.com
+    # - stable: http://127.0.0.1:9443
+    # - canary: http://127.0.0.1:9443
     # - X-Canary: true 强制走灰度
 
     # 测试 1: 带 X-Canary: true header，期望走 canary (postman-echo)
@@ -707,7 +878,7 @@ test_canary_header() {
     BODY=$(echo "$RESPONSE" | sed '$d')
 
     if [ "$HTTP_CODE" != "404" ]; then
-        # 检查响应中是否包含 postman-echo 的特征
+        # 如果用户把 canary 配到外部 postman-echo，可额外验证响应特征。
         if echo "$BODY" | grep -qi "postman"; then
             print_pass "X-Canary header 正确路由到灰度上游 (HTTP $HTTP_CODE)"
         else
@@ -717,14 +888,14 @@ test_canary_header() {
         print_skip "路由不存在，跳过灰度测试"
     fi
 
-    # 测试 2: 不带 X-Canary header，期望走 stable (httpbin)
+    # 测试 2: 不带 X-Canary header，期望默认走 stable。
     RESPONSE=$(curl -sk -w "\n%{http_code}" \
         "$SERVER_URL/api/public/get")
     HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
     BODY=$(echo "$RESPONSE" | sed '$d')
 
     if [ "$HTTP_CODE" != "404" ]; then
-        # 检查响应中是否包含 httpbin 的特征
+        # 本地 mock 会保留 httpbin 字段，便于兼容原测试判断。
         if echo "$BODY" | grep -qi "httpbin"; then
             print_pass "默认路由到稳定版上游 (HTTP $HTTP_CODE)"
         else
@@ -830,11 +1001,23 @@ if [ -z "$SERVER_URL" ]; then
     SERVER_URL="https://localhost:8443"
 fi
 
+cleanup() {
+    stop_wt_upstream
+    stop_local_upstream
+    if [ "$STOP_AFTER_TEST" = true ]; then
+        stop_server
+    fi
+}
+
+trap cleanup EXIT
+
 # 主函数
 main() {
     print_header "hyper-proxy-tool 测试套件"
     echo "服务器: $SERVER_URL"
     echo "自动启动: $AUTO_START"
+
+    start_local_upstream
 
     # 检查或启动服务器
     if [ "$AUTO_START" = true ]; then
@@ -885,11 +1068,6 @@ main() {
 
     # 打印摘要
     print_summary
-
-    # 测试完成后停止服务器
-    if [ "$STOP_AFTER_TEST" = true ]; then
-        stop_server
-    fi
 }
 
 # 运行

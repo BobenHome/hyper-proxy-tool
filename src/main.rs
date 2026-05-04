@@ -35,6 +35,7 @@ mod config;
 mod error;
 mod health;
 mod metrics;
+mod pipeline;
 mod plugin;
 mod proxy;
 mod retry;

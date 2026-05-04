@@ -13,6 +13,9 @@ WebTransport over HTTP/3 测试脚本
 """
 
 import asyncio
+import base64
+import hmac
+import json
 import os
 import ssl
 import subprocess
@@ -37,6 +40,24 @@ _raw_server_url = os.environ.get("SERVER_URL", "https://127.0.0.1:8443")
 SERVER_URL = _raw_server_url.replace("://localhost:", "://127.0.0.1:")
 TEST_PATH = "/api/public/webtransport"
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+JWT_SECRET = os.environ.get("JWT_SECRET", "a-string-secret-at-least-256-bits-long")
+
+
+def _b64url(data: bytes) -> bytes:
+    return base64.urlsafe_b64encode(data).rstrip(b"=")
+
+
+def make_jwt() -> str:
+    header = {"alg": "HS256", "typ": "JWT"}
+    payload = {"sub": "testuser", "exp": int(time.time()) + 3600}
+    signing_input = b".".join(
+        [
+            _b64url(json.dumps(header, separators=(",", ":")).encode()),
+            _b64url(json.dumps(payload, separators=(",", ":")).encode()),
+        ]
+    )
+    signature = hmac.new(JWT_SECRET.encode(), signing_input, "sha256").digest()
+    return b".".join([signing_input, _b64url(signature)]).decode()
 
 
 class H3ClientProtocol(QuicConnectionProtocol):
@@ -158,6 +179,7 @@ async def test_webtransport() -> bool:
                 (b":authority", f"{host}:{port}".encode()),
                 (b":path", TEST_PATH.encode()),
                 (b":protocol", b"webtransport"),
+                (b"authorization", f"Bearer {make_jwt()}".encode()),
             ],
         )
         protocol.transmit()

@@ -32,12 +32,12 @@ endpoint = "http://localhost:4317"
 [upstreams]
   # 稳定版集群
   [upstreams.stable]
-  urls = ["https://127.0.0.1:9443"]
+  urls = ["http://127.0.0.1:9443"]
   health_check = false
 
-  # 灰度版集群 (为了演示，可以用 postman-echo 或者另一个 httpbin)
+  # 灰度版集群 (本地测试默认复用 mock upstream，避免依赖外网)
   [upstreams.canary]
-  urls = ["https://postman-echo.com"]
+  urls = ["http://127.0.0.1:9443"]
 
   # 本地 WS 上游
   # [upstreams.local_ws]

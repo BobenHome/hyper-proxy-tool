@@ -7,8 +7,11 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::{error, info, warn};
 
-use crate::config::{AppConfig, RouteConfig};
+use crate::config::AppConfig;
 use crate::error::ProxyError;
+use crate::pipeline::{
+    self, LocalReplyKind, PipelineDecision, PipelineReject, ProtocolKind, RequestContext,
+};
 use crate::state::{AppState, HttpClient};
 
 /// Check if request is a WebTransport handshake request
@@ -19,28 +22,6 @@ pub fn is_webtransport_request<B>(req: &Request<B>) -> bool {
             .get::<Protocol>()
             .map(|p| p == &Protocol::WEB_TRANSPORT)
             .unwrap_or(false)
-}
-
-/// Find a matching route for the given path from AppConfig.
-/// Only returns routes that have `webtransport = true`.
-fn match_route<'a>(path: &str, routes: &'a [RouteConfig]) -> Option<&'a RouteConfig> {
-    routes
-        .iter()
-        .find(|route| path.starts_with(&route.path) && route.webtransport)
-}
-
-/// Select an upstream URL using round-robin over healthy nodes.
-fn select_upstream_url(upstream_state: &crate::state::UpstreamState) -> Option<String> {
-    let active_urls_guard = upstream_state.active_urls.load();
-    let active_urls = &**active_urls_guard;
-
-    if active_urls.is_empty() {
-        return None;
-    }
-
-    let current_count = upstream_state.counter.fetch_add(1, Ordering::Relaxed);
-    let index = current_count % active_urls.len();
-    Some(active_urls[index].clone())
 }
 
 /// Establish a WebTransport connection to an upstream server.
@@ -97,6 +78,16 @@ async fn proxy_bidi_stream(
     }
 }
 
+async fn send_reject_response(
+    mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    reject: PipelineReject,
+) -> Result<(), ProxyError> {
+    let resp = Response::builder().status(reject.status).body(()).unwrap();
+    let _ = stream.send_response(resp).await;
+    let _ = stream.finish().await;
+    Ok(())
+}
+
 /// Handle WebTransport session over HTTP/3 with upstream proxying.
 pub async fn handle_webtransport_session(
     req: Request<()>,
@@ -107,62 +98,63 @@ pub async fn handle_webtransport_session(
     _remote_addr: SocketAddr,
     h3_server_conn: h3::server::Connection<h3_quinn::Connection, Bytes>,
 ) -> Result<(), ProxyError> {
-    let path = req.uri().path().to_string();
-
-    // 1. Match route using real AppConfig
-    let current_config = config.load();
-    let route = match match_route(&path, &current_config.routes) {
-        Some(r) => r,
-        None => {
-            warn!("WebTransport request to unknown route: {}", path);
-            let mut error_stream = stream;
-            let error_resp = Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(())
-                .unwrap();
-            let _ = error_stream.send_response(error_resp).await;
-            let _ = error_stream.finish().await;
+    let current_config = config.load_full();
+    let ctx = RequestContext {
+        protocol: ProtocolKind::WebTransport,
+        method: req.method(),
+        uri: req.uri(),
+        headers: req.headers(),
+        remote_addr: _remote_addr,
+    };
+    let plan = match pipeline::evaluate_request(&ctx, current_config, &state) {
+        PipelineDecision::LocalReply(LocalReplyKind::Health) => {
+            let mut s = stream;
+            let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
+            let _ = s.send_response(resp).await;
+            let _ = s.finish().await;
             return Ok(());
         }
+        PipelineDecision::Reject(reject) => {
+            if matches!(reject.reason, pipeline::RejectReason::RouteNotFound) {
+                warn!(
+                    "WebTransport request to unknown route: {}",
+                    req.uri().path()
+                );
+            }
+            return send_reject_response(stream, reject).await;
+        }
+        PipelineDecision::Forward(plan) => plan,
     };
 
-    // 2. Select upstream using existing round-robin logic
-    let current_state_map = state.upstreams.load();
-    let upstream_state = match current_state_map.get(&route.upstream) {
-        Some(s) => s,
-        None => {
-            error!("Upstream '{}' not found for WebTransport", route.upstream);
-            let mut error_stream = stream;
-            let error_resp = Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(())
-                .unwrap();
-            let _ = error_stream.send_response(error_resp).await;
-            let _ = error_stream.finish().await;
-            return Ok(());
-        }
-    };
+    if !plan.route.webtransport {
+        warn!(
+            "WebTransport request matched non-WebTransport route: {}",
+            plan.original_path
+        );
+        return send_reject_response(
+            stream,
+            PipelineReject {
+                status: StatusCode::NOT_FOUND,
+                reason: pipeline::RejectReason::RouteNotFound,
+                message: "404 Not Found".to_string(),
+                metrics_upstream: plan.target_upstream_name.clone(),
+            },
+        )
+        .await;
+    }
 
-    let upstream_url = match select_upstream_url(upstream_state) {
-        Some(url) => url,
-        None => {
-            let mut error_stream = stream;
-            let error_resp = Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(())
-                .unwrap();
-            let _ = error_stream.send_response(error_resp).await;
-            let _ = error_stream.finish().await;
-            return Ok(());
-        }
+    let upstream_url = {
+        let current_count = plan.upstream_state.counter.fetch_add(1, Ordering::Relaxed);
+        let index = current_count % plan.active_urls.len();
+        plan.active_urls[index].clone()
     };
 
     info!(
         "WebTransport session for {} -> upstream {} (URL: {})",
-        path, route.upstream, upstream_url
+        plan.original_path, plan.target_upstream_name, upstream_url
     );
 
-    // 3. Connect to upstream before accepting the client session. If the proxy target is
+    // Connect to upstream before accepting the client session. If the proxy target is
     // unavailable, fail the handshake instead of returning a successful echo session.
     let upstream_conn = match connect_upstream(&upstream_url).await {
         Ok(conn) => {
@@ -188,7 +180,7 @@ pub async fn handle_webtransport_session(
         }
     };
 
-    // 4. Accept the client WebTransport session
+    // Accept the client WebTransport session
     let session =
         match h3_webtransport::server::WebTransportSession::accept(req, stream, h3_server_conn)
             .await
@@ -202,7 +194,7 @@ pub async fn handle_webtransport_session(
 
     info!("WebTransport client session established");
 
-    // 5. Handle streams through the configured upstream.
+    // Handle streams through the configured upstream.
     loop {
         match session.accept_bi().await {
             Ok(Some(h3_webtransport::server::AcceptedBi::BidiStream(_session_id, bidi_stream))) => {
@@ -238,6 +230,6 @@ pub async fn handle_webtransport_session(
         }
     }
 
-    info!("WebTransport session ended for {}", path);
+    info!("WebTransport session ended for {}", plan.original_path);
     Ok(())
 }
