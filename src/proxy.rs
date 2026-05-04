@@ -28,6 +28,14 @@ use crate::websocket::{handle_websocket, is_websocket_request};
 
 const MAX_BUFFER_SIZE: u64 = 64 * 1024;
 
+struct Http3ProxyRequest {
+    method: hyper::Method,
+    uri: hyper::Uri,
+    headers: hyper::HeaderMap,
+    body: bytes::Bytes,
+    remote_addr: SocketAddr,
+}
+
 fn pipeline_reject_to_http_response(
     reject: PipelineReject,
 ) -> Response<BoxBody<Bytes, ProxyError>> {
@@ -174,17 +182,7 @@ pub async fn proxy_handler(
     }
 
     if should_buffer {
-        handle_buffered_request(
-            parts,
-            body,
-            client,
-            state,
-            &plan,
-            remote_addr,
-            &method,
-            start,
-        )
-        .await
+        handle_buffered_request(parts, body, client, state, &plan, remote_addr, start).await
     } else {
         handle_streaming_request(parts, body, client, &plan, remote_addr, &method, start).await
     }
@@ -197,9 +195,9 @@ async fn handle_buffered_request(
     state: Arc<AppState>,
     plan: &ForwardPlan,
     remote_addr: SocketAddr,
-    method_str: &str,
     start: Instant,
 ) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError> {
+    let method_str = parts.method.as_str();
     let body_bytes = body.collect().await?.to_bytes();
     let body_full = Full::new(body_bytes);
 
@@ -475,20 +473,17 @@ pub async fn handle_http3_request(
         }
     }
 
-    let method = req.method().clone();
-    let uri = req.uri().clone();
-    let headers = req.headers().clone();
-    let body_data = bytes::Bytes::from(body_bytes);
-
     let resp = match proxy_http3_request(
-        method,
-        uri,
-        headers,
-        body_data,
+        Http3ProxyRequest {
+            method: req.method().clone(),
+            uri: req.uri().clone(),
+            headers: req.headers().clone(),
+            body: bytes::Bytes::from(body_bytes),
+            remote_addr,
+        },
         client,
         config,
         state,
-        remote_addr,
     )
     .await
     {
@@ -536,24 +531,20 @@ pub async fn handle_http3_request(
 
 /// HTTP/3 proxy request handler
 async fn proxy_http3_request(
-    method: hyper::Method,
-    uri: hyper::Uri,
-    headers: hyper::HeaderMap,
-    body: bytes::Bytes,
+    req: Http3ProxyRequest,
     client: Arc<HttpClient>,
     config: Arc<arc_swap::ArcSwap<AppConfig>>,
     state: Arc<AppState>,
-    remote_addr: SocketAddr,
 ) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError> {
     let start = Instant::now();
-    let method_str = method.to_string();
+    let method_str = req.method.to_string();
     let current_config = config.load_full();
     let ctx = RequestContext {
         protocol: ProtocolKind::Http3,
-        method: &method,
-        uri: &uri,
-        headers: &headers,
-        remote_addr,
+        method: &req.method,
+        uri: &req.uri,
+        headers: &req.headers,
+        remote_addr: req.remote_addr,
     };
     let plan = match pipeline::evaluate_request(&ctx, current_config, &state) {
         PipelineDecision::LocalReply(LocalReplyKind::Health) => {
@@ -564,7 +555,7 @@ async fn proxy_http3_request(
         }
         PipelineDecision::Reject(reject) => {
             if matches!(reject.reason, pipeline::RejectReason::RouteNotFound) {
-                info!("HTTP/3 No route matched for path: {}", uri.path());
+                info!("HTTP/3 No route matched for path: {}", req.uri.path());
             }
             record_metrics(
                 &method_str,
@@ -603,7 +594,7 @@ async fn proxy_http3_request(
     }
 
     // X-User-Id injection
-    let mut req_headers = headers.clone();
+    let mut req_headers = req.headers.clone();
     if let Some(claim) = &plan.claims
         && let Ok(val) = hyper::header::HeaderValue::from_str(&claim.sub)
     {
@@ -611,7 +602,7 @@ async fn proxy_http3_request(
     }
 
     // Build and send upstream request
-    let body_full = Full::new(body);
+    let body_full = Full::new(req.body);
     let max_failover_attempts = plan.active_urls.len();
     let mut last_error: Option<String> = None;
 
@@ -644,7 +635,7 @@ async fn proxy_http3_request(
         };
 
         let mut builder = Request::builder()
-            .method(method.clone())
+            .method(req.method.clone())
             .uri(new_uri)
             .version(Version::HTTP_11);
         for (k, v) in &req_headers {
@@ -653,7 +644,7 @@ async fn proxy_http3_request(
         if let Some(host) = upstream_base.host() {
             builder = builder.header("Host", host);
         }
-        builder = builder.header("x-forwarded-for", remote_addr.ip().to_string());
+        builder = builder.header("x-forwarded-for", req.remote_addr.ip().to_string());
 
         // Tracing injection
         let ctx = tracing::Span::current().context();

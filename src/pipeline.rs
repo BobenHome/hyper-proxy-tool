@@ -74,7 +74,7 @@ pub struct ForwardPlan {
 pub enum PipelineDecision {
     LocalReply(LocalReplyKind),
     Reject(PipelineReject),
-    Forward(ForwardPlan),
+    Forward(Box<ForwardPlan>),
 }
 
 pub fn evaluate_request(
@@ -141,7 +141,7 @@ pub fn evaluate_request(
         request_has_auth,
     );
 
-    PipelineDecision::Forward(ForwardPlan {
+    PipelineDecision::Forward(Box::new(ForwardPlan {
         protocol: ctx.protocol,
         route,
         claims,
@@ -153,7 +153,7 @@ pub fn evaluate_request(
         request_has_auth,
         cache_key,
         is_canary,
-    })
+    }))
 }
 
 fn check_ip_limit(ctx: &RequestContext<'_>, state: &AppState) -> Result<(), PipelineReject> {

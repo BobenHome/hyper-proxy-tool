@@ -3,14 +3,14 @@ use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed, keyed};
 use governor::{Quota, RateLimiter};
 use hyper_rustls::HttpsConnector;
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
 use jsonwebtoken::DecodingKey;
 use moka::future::Cache;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use crate::cache::CachedResponse;
 use crate::config::{AppConfig, RateLimitConfig};
@@ -18,13 +18,26 @@ use crate::error::ProxyError;
 use crate::plugin::PluginModule;
 
 /// HTTP client type alias
-pub type HttpClient = Client<HttpsConnector<HttpConnector>, http_body_util::combinators::BoxBody<bytes::Bytes, ProxyError>>;
+pub type HttpClient = Client<
+    HttpsConnector<HttpConnector>,
+    http_body_util::combinators::BoxBody<bytes::Bytes, ProxyError>,
+>;
 
 /// IP rate limiter type (keyed by IP address)
-pub type IpRateLimiter = RateLimiter<std::net::IpAddr, keyed::DefaultKeyedStateStore<std::net::IpAddr>, DefaultClock>;
+pub type IpRateLimiter =
+    RateLimiter<std::net::IpAddr, keyed::DefaultKeyedStateStore<std::net::IpAddr>, DefaultClock>;
 
 /// Route rate limiter type (not keyed, global counter)
 pub type RouteRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
+
+/// State fragments derived from configuration.
+pub struct ConfigStateParts {
+    pub upstreams: HashMap<String, Arc<UpstreamState>>,
+    pub ip_limiter: Option<Arc<IpRateLimiter>>,
+    pub route_limiters: HashMap<String, Arc<RouteRateLimiter>>,
+    pub jwt_key: Option<Arc<DecodingKey>>,
+    pub plugins: HashMap<String, Arc<PluginModule>>,
+}
 
 /// Upstream state with active URLs and round-robin counter
 pub struct UpstreamState {
@@ -51,29 +64,21 @@ pub struct AppState {
 impl AppState {
     /// Create a new AppState from configuration
     pub fn from_config(config: &AppConfig) -> Self {
-        let (upstreams, ip_limiter, route_limiters, jwt_key, plugins) = create_state_from_config(config);
+        let parts = create_state_from_config(config);
 
         Self {
-            upstreams: ArcSwap::new(Arc::new(upstreams)),
-            ip_limiter: ArcSwap::new(Arc::new(ip_limiter)),
-            route_limiters: ArcSwap::new(Arc::new(route_limiters)),
-            jwt_key: ArcSwap::new(Arc::new(jwt_key)),
-            plugins: ArcSwap::new(Arc::new(plugins)),
+            upstreams: ArcSwap::new(Arc::new(parts.upstreams)),
+            ip_limiter: ArcSwap::new(Arc::new(parts.ip_limiter)),
+            route_limiters: ArcSwap::new(Arc::new(parts.route_limiters)),
+            jwt_key: ArcSwap::new(Arc::new(parts.jwt_key)),
+            plugins: ArcSwap::new(Arc::new(parts.plugins)),
             response_cache: Cache::builder().max_capacity(10_000).build(),
         }
     }
 }
 
 /// Create state from configuration
-pub fn create_state_from_config(
-    config: &AppConfig,
-) -> (
-    HashMap<String, Arc<UpstreamState>>,
-    Option<Arc<IpRateLimiter>>,
-    HashMap<String, Arc<RouteRateLimiter>>,
-    Option<Arc<DecodingKey>>,
-    HashMap<String, Arc<PluginModule>>,
-) {
+pub fn create_state_from_config(config: &AppConfig) -> ConfigStateParts {
     // 1. Upstreams
     let mut upstreams_state = HashMap::new();
     for (name, u_conf) in &config.upstreams {
@@ -98,32 +103,36 @@ pub fn create_state_from_config(
     let mut plugins = HashMap::new();
     for route in &config.routes {
         if let Some(limit_conf) = &route.limit
-            && let Some(limiter) = create_route_limiter(limit_conf) {
-                route_limiters.insert(route.path.clone(), Arc::new(limiter));
-            }
+            && let Some(limiter) = create_route_limiter(limit_conf)
+        {
+            route_limiters.insert(route.path.clone(), Arc::new(limiter));
+        }
         if let Some(path) = &route.plugin
-            && !plugins.contains_key(path) {
-                if let Ok(module) = PluginModule::new(path) {
-                    tracing::info!("Loaded Wasm plugin: {}", path);
-                    plugins.insert(path.clone(), Arc::new(module));
-                } else {
-                    tracing::error!("Failed to load Wasm plugin: {}", path);
-                }
+            && !plugins.contains_key(path)
+        {
+            if let Ok(module) = PluginModule::new(path) {
+                tracing::info!("Loaded Wasm plugin: {}", path);
+                plugins.insert(path.clone(), Arc::new(module));
+            } else {
+                tracing::error!("Failed to load Wasm plugin: {}", path);
             }
+        }
     }
 
     // 4. JWT Key
-    let jwt_key = config.server.jwt_secret.as_ref().map(|secret| {
-        Arc::new(DecodingKey::from_secret(secret.as_bytes()))
-    });
+    let jwt_key = config
+        .server
+        .jwt_secret
+        .as_ref()
+        .map(|secret| Arc::new(DecodingKey::from_secret(secret.as_bytes())));
 
-    (
-        upstreams_state,
-        ip_limiter.map(Arc::new),
+    ConfigStateParts {
+        upstreams: upstreams_state,
+        ip_limiter: ip_limiter.map(Arc::new),
         route_limiters,
         jwt_key,
         plugins,
-    )
+    }
 }
 
 /// Create IP rate limiter from config

@@ -214,21 +214,23 @@ async fn main() -> Result<(), error::ProxyError> {
 
                                 manager_config.store(Arc::new(new_conf.clone()));
 
-                                let (
-                                    new_upstreams,
-                                    new_ip_limiter,
-                                    new_route_limiters,
-                                    new_jwt_key,
-                                    new_plugins,
-                                ) = state::create_state_from_config(&new_conf);
+                                let new_state_parts = state::create_state_from_config(&new_conf);
 
-                                manager_state.upstreams.store(Arc::new(new_upstreams));
-                                manager_state.ip_limiter.store(Arc::new(new_ip_limiter));
+                                manager_state
+                                    .upstreams
+                                    .store(Arc::new(new_state_parts.upstreams));
+                                manager_state
+                                    .ip_limiter
+                                    .store(Arc::new(new_state_parts.ip_limiter));
                                 manager_state
                                     .route_limiters
-                                    .store(Arc::new(new_route_limiters));
-                                manager_state.jwt_key.store(Arc::new(new_jwt_key));
-                                manager_state.plugins.store(Arc::new(new_plugins));
+                                    .store(Arc::new(new_state_parts.route_limiters));
+                                manager_state
+                                    .jwt_key
+                                    .store(Arc::new(new_state_parts.jwt_key));
+                                manager_state
+                                    .plugins
+                                    .store(Arc::new(new_state_parts.plugins));
 
                                 cancel_token.cancel();
                                 let _ = health_handle.await;
