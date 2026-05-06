@@ -2,26 +2,25 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::header::CONTENT_LENGTH;
-use tower::service_fn;
 
 use hyper::{Method, Request, Response, StatusCode, Uri, Version};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
-use tower::{ServiceBuilder, ServiceExt};
 use tracing::{error, info, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::cache::parse_cache_max_age;
 use crate::config::AppConfig;
 use crate::error::ProxyError;
-use crate::metrics::record_metrics;
+use crate::metrics::{
+    record_metrics, record_upstream_circuit_open, record_upstream_retry, record_upstream_timeout,
+};
 use crate::pipeline::{
     self, ForwardPlan, LocalReplyKind, PipelineDecision, PipelineReject, ProtocolKind,
     RequestContext,
 };
-use crate::retry::ProxyRetryPolicy;
 use crate::state::{AppState, HttpClient};
 use crate::telemetry::HeaderInjector;
 use crate::websocket::{handle_websocket, is_websocket_request};
@@ -60,6 +59,72 @@ fn pipeline_reject_to_http3_response(
                 .boxed(),
         )
         .unwrap()
+}
+
+fn fallback_response(plan: &ForwardPlan) -> Response<BoxBody<Bytes, ProxyError>> {
+    let status =
+        StatusCode::from_u16(plan.resilience.fallback_status).unwrap_or(StatusCode::BAD_GATEWAY);
+    Response::builder()
+        .status(status)
+        .body(
+            Full::new(Bytes::from(plan.resilience.fallback_body.clone()))
+                .map_err(|e| match e {})
+                .boxed(),
+        )
+        .unwrap()
+}
+
+fn should_retry_status(status: StatusCode) -> bool {
+    status.is_server_error()
+}
+
+fn max_request_attempts(plan: &ForwardPlan) -> usize {
+    plan.active_urls
+        .len()
+        .max(1)
+        .saturating_mul(plan.resilience.retry_attempts.max(1))
+}
+
+fn select_available_upstream(plan: &ForwardPlan) -> Option<&str> {
+    let node_count = plan.active_urls.len();
+    for _ in 0..node_count {
+        let current_count = plan.upstream_state.counter.fetch_add(1, Ordering::Relaxed);
+        let index = current_count % node_count;
+        let upstream_url = plan.active_urls[index].as_str();
+        if plan
+            .upstream_state
+            .is_node_available(upstream_url, &plan.resilience)
+        {
+            return Some(upstream_url);
+        }
+
+        warn!(
+            "Circuit breaker open, skipping upstream node {} for {}",
+            upstream_url, plan.target_upstream_name
+        );
+    }
+
+    None
+}
+
+async fn send_upstream_request(
+    client: &HttpClient,
+    req: Request<BoxBody<Bytes, ProxyError>>,
+    plan: &ForwardPlan,
+    method: &str,
+) -> Result<Response<Incoming>, ProxyError> {
+    let request_fut = client.request(req);
+    if let Some(timeout) = plan.resilience.timeout_duration() {
+        match tokio::time::timeout(timeout, request_fut).await {
+            Ok(result) => result.map_err(|e| Box::new(e) as ProxyError),
+            Err(_) => {
+                record_upstream_timeout(method, &plan.target_upstream_name);
+                Err(anyhow::anyhow!("upstream request timed out after {:?}", timeout).into())
+            }
+        }
+    } else {
+        request_fut.await.map_err(|e| Box::new(e) as ProxyError)
+    }
 }
 
 /// Main proxy handler for HTTP/1.1 and HTTP/2
@@ -201,13 +266,17 @@ async fn handle_buffered_request(
     let body_bytes = body.collect().await?.to_bytes();
     let body_full = Full::new(body_bytes);
 
-    let max_failover_attempts = plan.active_urls.len();
+    let max_failover_attempts = max_request_attempts(plan);
     let mut last_error: Option<ProxyError> = None;
 
     for attempt in 0..max_failover_attempts {
-        let current_count = plan.upstream_state.counter.fetch_add(1, Ordering::Relaxed);
-        let index = current_count % plan.active_urls.len();
-        let upstream_url_str = &plan.active_urls[index];
+        let Some(upstream_url_str) = select_available_upstream(plan) else {
+            warn!(
+                "No available upstream node for {} after circuit breaker filtering",
+                plan.target_upstream_name
+            );
+            break;
+        };
 
         let upstream_base = match upstream_url_str.parse::<Uri>() {
             Ok(u) => u,
@@ -252,26 +321,43 @@ async fn handle_buffered_request(
             });
         }
 
-        let retry_req = match builder.body(body_full.clone()) {
+        let upstream_req = match builder.body(body_full.clone().map_err(|e| match e {}).boxed()) {
             Ok(r) => r,
             Err(_) => continue,
         };
 
-        let retry_service = ServiceBuilder::new()
-            .layer(tower::retry::RetryLayer::new(ProxyRetryPolicy::new(3)))
-            .service(service_fn(|req: Request<Full<Bytes>>| {
-                let client = client.clone();
-                async move {
-                    let (parts, body) = req.into_parts();
-                    let boxed_body = body.map_err(|e| match e {}).boxed();
-                    let new_req = Request::from_parts(parts, boxed_body);
-                    client.request(new_req).await
-                }
-            }));
-
-        match retry_service.oneshot(retry_req).await {
+        match send_upstream_request(&client, upstream_req, plan, method_str).await {
             Ok(mut res) => {
                 let status = res.status();
+                if should_retry_status(status) {
+                    warn!(
+                        "Upstream {} returned retryable status {}",
+                        upstream_url_str, status
+                    );
+                    if plan
+                        .upstream_state
+                        .record_node_failure(upstream_url_str, &plan.resilience)
+                    {
+                        record_upstream_circuit_open(
+                            method_str,
+                            &plan.target_upstream_name,
+                            upstream_url_str,
+                        );
+                    }
+                    if attempt + 1 < max_failover_attempts {
+                        record_upstream_retry(method_str, &plan.target_upstream_name);
+                        continue;
+                    }
+
+                    last_error = Some(crate::error::error(format!(
+                        "upstream returned retryable status {}",
+                        status
+                    )));
+                    break;
+                } else {
+                    plan.upstream_state.record_node_success(upstream_url_str);
+                }
+
                 let status_str = status.as_u16().to_string();
                 record_metrics(method_str, &status_str, &plan.target_upstream_name, start);
 
@@ -339,17 +425,29 @@ async fn handle_buffered_request(
                     "Upstream {} failed: {:?}. Switching node...",
                     upstream_url_str, err
                 );
-                last_error = Some(Box::new(err));
+                if plan
+                    .upstream_state
+                    .record_node_failure(upstream_url_str, &plan.resilience)
+                {
+                    record_upstream_circuit_open(
+                        method_str,
+                        &plan.target_upstream_name,
+                        upstream_url_str,
+                    );
+                }
+                if attempt + 1 < max_failover_attempts {
+                    record_upstream_retry(method_str, &plan.target_upstream_name);
+                }
+                last_error = Some(err);
             }
         }
     }
 
     error!("All upstreams failed. Last: {:?}", last_error);
-    record_metrics(method_str, "502", &plan.target_upstream_name, start);
-    Ok(Response::builder()
-        .status(502)
-        .body(Empty::new().map_err(|e| match e {}).boxed())
-        .unwrap())
+    let resp = fallback_response(plan);
+    let status = resp.status().as_u16().to_string();
+    record_metrics(method_str, &status, &plan.target_upstream_name, start);
+    Ok(resp)
 }
 
 async fn handle_streaming_request(
@@ -361,20 +459,28 @@ async fn handle_streaming_request(
     method_str: &str,
     start: Instant,
 ) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError> {
-    let current_count = plan.upstream_state.counter.fetch_add(1, Ordering::Relaxed);
-    let index = current_count % plan.active_urls.len();
-    let upstream_url_str = &plan.active_urls[index];
+    let Some(upstream_url_str) = select_available_upstream(plan) else {
+        warn!(
+            "No available streaming upstream node for {}",
+            plan.target_upstream_name
+        );
+        let resp = fallback_response(plan);
+        let status = resp.status().as_u16().to_string();
+        record_metrics(method_str, &status, &plan.target_upstream_name, start);
+        return Ok(resp);
+    };
+
     let upstream_base = match upstream_url_str.parse::<Uri>() {
         Ok(u) => u,
         Err(_) => {
-            return Ok(Response::builder()
-                .status(502)
-                .body(Empty::new().map_err(|e| match e {}).boxed())
-                .unwrap());
+            let resp = fallback_response(plan);
+            let status = resp.status().as_u16().to_string();
+            record_metrics(method_str, &status, &plan.target_upstream_name, start);
+            return Ok(resp);
         }
     };
 
-    info!("Streaming to {} (No Retry)", upstream_url_str);
+    info!("Streaming to {}", upstream_url_str);
 
     let base_str = upstream_base.to_string();
     let base_trimmed = base_str.trim_end_matches('/');
@@ -382,10 +488,10 @@ async fn handle_streaming_request(
     let new_uri = match uri_string.parse::<Uri>() {
         Ok(u) => u,
         Err(_) => {
-            return Ok(Response::builder()
-                .status(502)
-                .body(Empty::new().map_err(|e| match e {}).boxed())
-                .unwrap());
+            let resp = fallback_response(plan);
+            let status = resp.status().as_u16().to_string();
+            record_metrics(method_str, &status, &plan.target_upstream_name, start);
+            return Ok(resp);
         }
     };
 
@@ -418,19 +524,44 @@ async fn handle_streaming_request(
         }
     };
 
-    match client.request(streaming_req).await {
+    match send_upstream_request(&client, streaming_req, plan, method_str).await {
         Ok(res) => {
-            let status = res.status().as_u16().to_string();
+            let status_code = res.status();
+            if should_retry_status(status_code) {
+                if plan
+                    .upstream_state
+                    .record_node_failure(upstream_url_str, &plan.resilience)
+                {
+                    record_upstream_circuit_open(
+                        method_str,
+                        &plan.target_upstream_name,
+                        upstream_url_str,
+                    );
+                }
+            } else {
+                plan.upstream_state.record_node_success(upstream_url_str);
+            }
+
+            let status = status_code.as_u16().to_string();
             record_metrics(method_str, &status, &plan.target_upstream_name, start);
             Ok(res.map(|b| b.map_err(|e| Box::new(e) as ProxyError).boxed()))
         }
         Err(err) => {
             error!("Streaming failed: {:?}", err);
-            record_metrics(method_str, "502", &plan.target_upstream_name, start);
-            Ok(Response::builder()
-                .status(502)
-                .body(Empty::new().map_err(|e| match e {}).boxed())
-                .unwrap())
+            if plan
+                .upstream_state
+                .record_node_failure(upstream_url_str, &plan.resilience)
+            {
+                record_upstream_circuit_open(
+                    method_str,
+                    &plan.target_upstream_name,
+                    upstream_url_str,
+                );
+            }
+            let resp = fallback_response(plan);
+            let status = resp.status().as_u16().to_string();
+            record_metrics(method_str, &status, &plan.target_upstream_name, start);
+            Ok(resp)
         }
     }
 }
@@ -603,13 +734,17 @@ async fn proxy_http3_request(
 
     // Build and send upstream request
     let body_full = Full::new(req.body);
-    let max_failover_attempts = plan.active_urls.len();
+    let max_failover_attempts = max_request_attempts(&plan);
     let mut last_error: Option<String> = None;
 
     for attempt in 0..max_failover_attempts {
-        let current_count = plan.upstream_state.counter.fetch_add(1, Ordering::Relaxed);
-        let index = current_count % plan.active_urls.len();
-        let upstream_url_str = &plan.active_urls[index];
+        let Some(upstream_url_str) = select_available_upstream(&plan) else {
+            warn!(
+                "HTTP/3 no available upstream node for {} after circuit breaker filtering",
+                plan.target_upstream_name
+            );
+            break;
+        };
 
         let upstream_base = match upstream_url_str.parse::<Uri>() {
             Ok(u) => u,
@@ -654,26 +789,40 @@ async fn proxy_http3_request(
             });
         }
 
-        let retry_req = match builder.body(body_full.clone()) {
+        let upstream_req = match builder.body(body_full.clone().map_err(|e| match e {}).boxed()) {
             Ok(r) => r,
             Err(_) => continue,
         };
 
-        let retry_service = ServiceBuilder::new()
-            .layer(tower::retry::RetryLayer::new(ProxyRetryPolicy::new(3)))
-            .service(service_fn(|req: Request<Full<Bytes>>| {
-                let client = client.clone();
-                async move {
-                    let (parts, body) = req.into_parts();
-                    let boxed_body = body.map_err(|e| match e {}).boxed();
-                    let new_req = Request::from_parts(parts, boxed_body);
-                    client.request(new_req).await
-                }
-            }));
-
-        match retry_service.oneshot(retry_req).await {
+        match send_upstream_request(&client, upstream_req, &plan, &method_str).await {
             Ok(mut res) => {
                 let status = res.status();
+                if should_retry_status(status) {
+                    warn!(
+                        "HTTP/3 upstream {} returned retryable status {}",
+                        upstream_url_str, status
+                    );
+                    if plan
+                        .upstream_state
+                        .record_node_failure(upstream_url_str, &plan.resilience)
+                    {
+                        record_upstream_circuit_open(
+                            &method_str,
+                            &plan.target_upstream_name,
+                            upstream_url_str,
+                        );
+                    }
+                    if attempt + 1 < max_failover_attempts {
+                        record_upstream_retry(&method_str, &plan.target_upstream_name);
+                        continue;
+                    }
+
+                    last_error = Some(format!("upstream returned retryable status {}", status));
+                    break;
+                } else {
+                    plan.upstream_state.record_node_success(upstream_url_str);
+                }
+
                 let status_str = status.as_u16().to_string();
                 record_metrics(&method_str, &status_str, &plan.target_upstream_name, start);
 
@@ -740,19 +889,27 @@ async fn proxy_http3_request(
             }
             Err(e) => {
                 error!("HTTP/3 upstream attempt {} failed: {:?}", attempt + 1, e);
+                if plan
+                    .upstream_state
+                    .record_node_failure(upstream_url_str, &plan.resilience)
+                {
+                    record_upstream_circuit_open(
+                        &method_str,
+                        &plan.target_upstream_name,
+                        upstream_url_str,
+                    );
+                }
+                if attempt + 1 < max_failover_attempts {
+                    record_upstream_retry(&method_str, &plan.target_upstream_name);
+                }
                 last_error = Some(format!("{:?}", e));
             }
         }
     }
 
     error!("HTTP/3 all upstream attempts failed: {:?}", last_error);
-    record_metrics(&method_str, "502", &plan.target_upstream_name, start);
-    Ok(Response::builder()
-        .status(502)
-        .body(
-            Full::new(Bytes::from("502 Bad Gateway"))
-                .map_err(|e| match e {})
-                .boxed(),
-        )
-        .unwrap())
+    let resp = fallback_response(&plan);
+    let status = resp.status().as_u16().to_string();
+    record_metrics(&method_str, &status, &plan.target_upstream_name, start);
+    Ok(resp)
 }

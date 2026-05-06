@@ -77,6 +77,7 @@ pub struct RouteConfig {
     pub plugin: Option<String>,
     #[serde(default)]
     pub webtransport: bool,
+    pub resilience: Option<ResilienceConfig>,
 }
 
 /// Rate limit configuration
@@ -84,6 +85,62 @@ pub struct RouteConfig {
 pub struct RateLimitConfig {
     pub requests_per_second: u32,
     pub burst: u32,
+}
+
+/// Route-level upstream resilience policy.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ResilienceConfig {
+    #[serde(default)]
+    pub timeout_ms: u64,
+    #[serde(default = "default_retry_attempts")]
+    pub retry_attempts: usize,
+    #[serde(default)]
+    pub circuit_breaker_failures: usize,
+    #[serde(default = "default_circuit_breaker_reset_ms")]
+    pub circuit_breaker_reset_ms: u64,
+    #[serde(default = "default_fallback_status")]
+    pub fallback_status: u16,
+    #[serde(default = "default_fallback_body")]
+    pub fallback_body: String,
+}
+
+impl Default for ResilienceConfig {
+    fn default() -> Self {
+        Self {
+            timeout_ms: 0,
+            retry_attempts: default_retry_attempts(),
+            circuit_breaker_failures: 0,
+            circuit_breaker_reset_ms: default_circuit_breaker_reset_ms(),
+            fallback_status: default_fallback_status(),
+            fallback_body: default_fallback_body(),
+        }
+    }
+}
+
+impl ResilienceConfig {
+    pub fn timeout_duration(&self) -> Option<std::time::Duration> {
+        (self.timeout_ms > 0).then(|| std::time::Duration::from_millis(self.timeout_ms))
+    }
+
+    pub fn circuit_breaker_reset_duration(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.circuit_breaker_reset_ms)
+    }
+}
+
+fn default_retry_attempts() -> usize {
+    3
+}
+
+fn default_circuit_breaker_reset_ms() -> u64 {
+    30_000
+}
+
+fn default_fallback_status() -> u16 {
+    502
+}
+
+fn default_fallback_body() -> String {
+    "502 Bad Gateway".to_string()
 }
 
 /// Command line arguments

@@ -88,6 +88,15 @@ webtransport = true
   header_key = "X-Canary"
   header_value = "true"
 
+  # === 上游韧性治理 ===
+  [routes.resilience]
+  timeout_ms = 500
+  retry_attempts = 2
+  circuit_breaker_failures = 2
+  circuit_breaker_reset_ms = 1000
+  fallback_status = 503
+  fallback_body = "upstream temporarily unavailable"
+
 # [[routes]]
 # path = "/ws"
 # upstream = "local_ws"

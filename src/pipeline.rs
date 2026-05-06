@@ -6,7 +6,7 @@ use hyper::header::AUTHORIZATION;
 use hyper::{HeaderMap, Method, StatusCode, Uri};
 
 use crate::auth::{self, Claims};
-use crate::config::{AppConfig, RouteConfig};
+use crate::config::{AppConfig, ResilienceConfig, RouteConfig};
 use crate::plugin::{WasmInput, WasmOutput};
 use crate::state::{AppState, UpstreamState};
 
@@ -68,6 +68,7 @@ pub struct ForwardPlan {
     pub request_has_auth: bool,
     pub cache_key: Option<String>,
     pub is_canary: bool,
+    pub resilience: ResilienceConfig,
 }
 
 #[derive(Clone)]
@@ -143,6 +144,7 @@ pub fn evaluate_request(
 
     PipelineDecision::Forward(Box::new(ForwardPlan {
         protocol: ctx.protocol,
+        resilience: route.resilience.clone().unwrap_or_default(),
         route,
         claims,
         target_upstream_name,
@@ -375,6 +377,7 @@ mod tests {
             canary: None,
             plugin: None,
             webtransport: false,
+            resilience: None,
         }
     }
 

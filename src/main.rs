@@ -38,7 +38,6 @@ mod metrics;
 mod pipeline;
 mod plugin;
 mod proxy;
-mod retry;
 mod state;
 mod telemetry;
 mod tls;

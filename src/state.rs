@@ -10,10 +10,12 @@ use moka::future::Cache;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
+use std::time::Instant;
 
 use crate::cache::CachedResponse;
-use crate::config::{AppConfig, RateLimitConfig};
+use crate::config::{AppConfig, RateLimitConfig, ResilienceConfig};
 use crate::error::ProxyError;
 use crate::plugin::PluginModule;
 
@@ -30,6 +32,12 @@ pub type IpRateLimiter =
 /// Route rate limiter type (not keyed, global counter)
 pub type RouteRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
+#[derive(Debug, Default)]
+struct CircuitBreakerState {
+    consecutive_failures: usize,
+    opened_at: Option<Instant>,
+}
+
 /// State fragments derived from configuration.
 pub struct ConfigStateParts {
     pub upstreams: HashMap<String, Arc<UpstreamState>>,
@@ -43,6 +51,61 @@ pub struct ConfigStateParts {
 pub struct UpstreamState {
     pub active_urls: ArcSwap<Vec<String>>,
     pub counter: AtomicUsize,
+    circuit_breakers: Mutex<HashMap<String, CircuitBreakerState>>,
+}
+
+impl UpstreamState {
+    pub fn new(urls: Vec<String>) -> Self {
+        Self {
+            active_urls: ArcSwap::from_pointee(urls),
+            counter: AtomicUsize::new(0),
+            circuit_breakers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn is_node_available(&self, url: &str, resilience: &ResilienceConfig) -> bool {
+        if resilience.circuit_breaker_failures == 0 {
+            return true;
+        }
+
+        let reset_after = resilience.circuit_breaker_reset_duration();
+        let Ok(breakers) = self.circuit_breakers.lock() else {
+            return true;
+        };
+
+        match breakers.get(url).and_then(|state| state.opened_at) {
+            Some(opened_at) => opened_at.elapsed() >= reset_after,
+            None => true,
+        }
+    }
+
+    pub fn record_node_success(&self, url: &str) {
+        let Ok(mut breakers) = self.circuit_breakers.lock() else {
+            return;
+        };
+
+        breakers.remove(url);
+    }
+
+    pub fn record_node_failure(&self, url: &str, resilience: &ResilienceConfig) -> bool {
+        if resilience.circuit_breaker_failures == 0 {
+            return false;
+        }
+
+        let Ok(mut breakers) = self.circuit_breakers.lock() else {
+            return false;
+        };
+
+        let state = breakers.entry(url.to_string()).or_default();
+        state.consecutive_failures += 1;
+
+        if state.consecutive_failures >= resilience.circuit_breaker_failures {
+            state.opened_at = Some(Instant::now());
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Application shared state
@@ -84,10 +147,7 @@ pub fn create_state_from_config(config: &AppConfig) -> ConfigStateParts {
     for (name, u_conf) in &config.upstreams {
         upstreams_state.insert(
             name.clone(),
-            Arc::new(UpstreamState {
-                active_urls: ArcSwap::from_pointee(u_conf.urls.clone()),
-                counter: AtomicUsize::new(0),
-            }),
+            Arc::new(UpstreamState::new(u_conf.urls.clone())),
         );
     }
 

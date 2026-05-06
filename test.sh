@@ -82,6 +82,7 @@ start_local_upstream() {
         cd "$SCRIPT_DIR"
         python3 - <<'PY'
 import json
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -98,6 +99,19 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def _send_response(self, head_only=False):
+        if self.path.startswith("/slow"):
+            time.sleep(2)
+
+        if self.path.startswith("/error"):
+            body = b'{"error":"local-mock"}'
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if not head_only:
+                self.wfile.write(body)
+            return
+
         payload = {
             "httpbin": "local-mock",
             "path": self.path,
@@ -623,6 +637,47 @@ test_cache_hit() {
     fi
 }
 
+# 测试上游韧性治理 - 超时 fallback
+test_resilience_timeout() {
+    print_test "测试上游韧性治理 - 超时 fallback"
+
+    local TOKEN=""
+    if command -v uv &> /dev/null; then
+        TOKEN=$(uv run --with pyjwt python3 -c "
+import jwt
+import time
+payload = {'sub': 'testuser', 'exp': int(time.time()) + 3600}
+print(jwt.encode(payload, 'a-string-secret-at-least-256-bits-long', algorithm='HS256'))
+" 2>/dev/null || echo "")
+    fi
+
+    if [ -z "$TOKEN" ]; then
+        print_skip "无法生成 JWT token，跳过韧性治理测试"
+        return
+    fi
+
+    START_TS=$(date +%s)
+    RESPONSE=$(curl -sk -w "\n%{http_code}" \
+        -H "Authorization: Bearer $TOKEN" \
+        "$SERVER_URL/api/public/slow")
+    END_TS=$(date +%s)
+    HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+    BODY=$(echo "$RESPONSE" | sed '$d')
+    ELAPSED=$((END_TS - START_TS))
+
+    if [ "$HTTP_CODE" = "503" ] && echo "$BODY" | grep -q "upstream temporarily unavailable"; then
+        if [ "$ELAPSED" -le 3 ]; then
+            print_pass "上游超时后快速返回 fallback (HTTP 503)"
+        else
+            print_fail "fallback 返回过慢，耗时 ${ELAPSED}s"
+        fi
+    else
+        print_fail "超时 fallback 应返回 503，实际: $HTTP_CODE，响应: $BODY"
+    fi
+
+    sleep 2
+}
+
 # 测试 Alt-Svc 头
 test_alt_svc() {
     print_test "测试 Alt-Svc 头 (HTTP/3 支持)"
@@ -1056,6 +1111,10 @@ main() {
     print_header "缓存测试"
     test_cache_miss
     test_cache_hit
+
+    # 上游韧性治理测试
+    print_header "上游韧性治理测试"
+    test_resilience_timeout
 
     # HTTP/3 测试
     print_header "HTTP/3 测试"
