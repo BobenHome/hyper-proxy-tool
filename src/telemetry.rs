@@ -1,12 +1,12 @@
-use opentelemetry::trace::TracerProvider;
-use tracing_subscriber::prelude::*;
 use hyper::header::HeaderName;
 use opentelemetry::propagation::Injector;
+use opentelemetry::trace::TracerProvider;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::resource::Resource;
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use tracing_subscriber::prelude::*;
 
 use crate::config::TracingConfig;
 
@@ -16,9 +16,10 @@ pub struct HeaderInjector<'a>(pub &'a mut hyper::HeaderMap);
 impl<'a> Injector for HeaderInjector<'a> {
     fn set(&mut self, key: &str, value: String) {
         if let Ok(name) = HeaderName::from_bytes(key.as_bytes())
-            && let Ok(val) = hyper::header::HeaderValue::from_str(&value) {
-                self.0.insert(name, val);
-            }
+            && let Ok(val) = hyper::header::HeaderValue::from_str(&value)
+        {
+            self.0.insert(name, val);
+        }
     }
 }
 
@@ -70,10 +71,7 @@ pub fn init_tracer(config: &Option<TracingConfig>) {
             .with(telemetry)
             .init();
 
-        tracing::info!(
-            "Distributed Tracing enabled. Sending to {}",
-            conf.endpoint
-        );
+        tracing::info!("Distributed Tracing enabled. Sending to {}", conf.endpoint);
     } else {
         init_default_logger();
     }

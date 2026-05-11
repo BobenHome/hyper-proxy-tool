@@ -1,10 +1,10 @@
-use tracing::{info, warn};
 use arc_swap::ArcSwap;
-use hyper::Uri;
 use http_body_util::{BodyExt, Empty};
+use hyper::Uri;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
 
 use crate::config::AppConfig;
 use crate::error::ProxyError;
@@ -40,7 +40,10 @@ pub async fn start_health_check_loop(
                     let all_urls: Vec<String> = upstream_config.urls.clone();
                     let current = upstream_state.active_urls.load();
                     if current.len() != all_urls.len() {
-                        info!("Upstream '{}' health check disabled, marking all nodes healthy", name);
+                        info!(
+                            "Upstream '{}' health check disabled, marking all nodes healthy",
+                            name
+                        );
                         upstream_state.active_urls.store(Arc::new(all_urls));
                     }
                     continue;
