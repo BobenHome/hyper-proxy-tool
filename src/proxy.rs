@@ -35,6 +35,10 @@ struct Http3ProxyRequest {
     remote_addr: SocketAddr,
 }
 
+pub fn is_grpc_like_request<B>(req: &Request<B>) -> bool {
+    req.version() == Version::HTTP_2 && pipeline::is_grpc_content_type(req.headers())
+}
+
 fn pipeline_reject_to_http_response(
     reject: PipelineReject,
 ) -> Response<BoxBody<Bytes, ProxyError>> {
@@ -128,10 +132,11 @@ async fn send_upstream_request(
 }
 
 /// Main proxy handler for HTTP/1.1 and HTTP/2
-#[instrument(skip(client, config, state, req), fields(method = %req.method(), uri = %req.uri()))]
+#[instrument(skip(client, grpc_client, config, state, req), fields(method = %req.method(), uri = %req.uri()))]
 pub async fn proxy_handler(
     req: Request<Incoming>,
     client: Arc<HttpClient>,
+    grpc_client: Arc<HttpClient>,
     config: Arc<arc_swap::ArcSwap<AppConfig>>,
     state: Arc<AppState>,
     remote_addr: SocketAddr,
@@ -202,6 +207,14 @@ pub async fn proxy_handler(
         info!("Cache MISS for {}", cache_key);
     }
 
+    let is_grpc = matches!(plan.protocol, ProtocolKind::Grpc);
+    if is_grpc {
+        info!(
+            "gRPC route accepted: path={} final_path={} upstream_pool={}",
+            plan.original_path, plan.final_path, plan.target_upstream_name
+        );
+    }
+
     // WebSocket detection
     if matches!(plan.protocol, ProtocolKind::WebSocket) {
         let current_count = plan.upstream_state.counter.fetch_add(1, Ordering::Relaxed);
@@ -228,7 +241,9 @@ pub async fn proxy_handler(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
 
-    let should_buffer = if let Some(len) = content_length {
+    let should_buffer = if is_grpc {
+        false
+    } else if let Some(len) = content_length {
         len <= MAX_BUFFER_SIZE
     } else {
         matches!(
@@ -246,7 +261,9 @@ pub async fn proxy_handler(
         parts.headers.insert("X-User-Id", val);
     }
 
-    if should_buffer {
+    if is_grpc {
+        handle_streaming_request(parts, body, grpc_client, &plan, remote_addr, &method, start).await
+    } else if should_buffer {
         handle_buffered_request(parts, body, client, state, &plan, remote_addr, start).await
     } else {
         handle_streaming_request(parts, body, client, &plan, remote_addr, &method, start).await
@@ -480,7 +497,14 @@ async fn handle_streaming_request(
         }
     };
 
-    info!("Streaming to {}", upstream_url_str);
+    if matches!(plan.protocol, ProtocolKind::Grpc) {
+        info!(
+            "gRPC h2c LB -> upstream={} final_path={}",
+            upstream_url_str, plan.final_path
+        );
+    } else {
+        info!("Streaming to {}", upstream_url_str);
+    }
 
     let base_str = upstream_base.to_string();
     let base_trimmed = base_str.trim_end_matches('/');
@@ -495,10 +519,16 @@ async fn handle_streaming_request(
         }
     };
 
+    let upstream_version = if matches!(plan.protocol, ProtocolKind::Grpc) {
+        Version::HTTP_2
+    } else {
+        parts.version
+    };
+
     let mut builder = Request::builder()
         .method(parts.method)
         .uri(new_uri)
-        .version(parts.version);
+        .version(upstream_version);
     for (k, v) in &parts.headers {
         builder = builder.header(k, v);
     }
@@ -527,6 +557,12 @@ async fn handle_streaming_request(
     match send_upstream_request(&client, streaming_req, plan, method_str).await {
         Ok(res) => {
             let status_code = res.status();
+            if matches!(plan.protocol, ProtocolKind::Grpc) {
+                info!(
+                    "gRPC upstream response <- upstream={} status={}",
+                    upstream_url_str, status_code
+                );
+            }
             if should_retry_status(status_code) {
                 if plan
                     .upstream_state

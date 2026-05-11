@@ -172,6 +172,17 @@ async fn main() -> Result<(), error::ProxyError> {
         .build(https_connector);
     let client = Arc::new(client);
 
+    let grpc_connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_native_roots()?
+        .https_or_http()
+        .enable_http2()
+        .build();
+    let mut grpc_client_builder =
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new());
+    grpc_client_builder.pool_idle_timeout(Duration::from_secs(30));
+    grpc_client_builder.http2_only(true);
+    let grpc_client = Arc::new(grpc_client_builder.build(grpc_connector));
+
     // Config hot reload
     let (tx, mut rx) = mpsc::channel(1);
 
@@ -378,6 +389,7 @@ async fn main() -> Result<(), error::ProxyError> {
         };
 
         let client = client.clone();
+        let grpc_client = grpc_client.clone();
         let tls_acceptor = tls_acceptor.clone();
         let config = app_config.clone();
         let state = app_state.clone();
@@ -401,20 +413,43 @@ async fn main() -> Result<(), error::ProxyError> {
                 proxy::proxy_handler(
                     req,
                     client.clone(),
+                    grpc_client.clone(),
                     config.clone(),
                     state.clone(),
                     remote_addr,
                 )
             });
 
-            let inner_service = ServiceBuilder::new()
+            let normal_service = ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
                 .timeout(Duration::from_secs(10))
                 .concurrency_limit(100)
-                .service(proxy_service);
+                .service(proxy_service.clone())
+                .map_err(|err| -> BoxError { err })
+                .boxed_clone();
+
+            let grpc_service = ServiceBuilder::new()
+                .layer(TraceLayer::new_for_http())
+                .concurrency_limit(100)
+                .service(proxy_service)
+                .map_err(|err| -> BoxError { err })
+                .boxed_clone();
 
             let tower_service = tower::service_fn(move |req| {
-                let inner = inner_service.clone();
+                let is_grpc_like = proxy::is_grpc_like_request(&req);
+                if is_grpc_like {
+                    info!(
+                        "gRPC-like HTTP/2 request detected, bypassing 10s gateway timeout: {}",
+                        req.uri().path()
+                    );
+                }
+
+                let inner = if is_grpc_like {
+                    grpc_service.clone()
+                } else {
+                    normal_service.clone()
+                };
+
                 async move {
                     let resp = match inner.oneshot(req).await {
                         Ok(resp) => resp.map(BodyExt::boxed),

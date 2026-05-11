@@ -18,6 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SERVER_URL="https://localhost:8443"
 LOCAL_UPSTREAM_PID=""
 WT_UPSTREAM_PID=""
+GRPC_UPSTREAM_PIDS=""
 
 # 测试计数器
 TESTS_PASSED=0
@@ -168,6 +169,66 @@ stop_local_upstream() {
     rm -f /tmp/hyper-proxy-tool-upstream.pid
 }
 
+start_grpc_upstreams() {
+    if ! is_local_server_url; then
+        return
+    fi
+
+    if ! command -v node &> /dev/null; then
+        print_skip "node 不可用，无法启动本地 gRPC h2c 测试上游"
+        return
+    fi
+
+    print_test "启动本地 gRPC h2c 测试上游 (127.0.0.1:50051/50052)"
+
+    local started=0
+    for spec in "50051:grpc-a" "50052:grpc-b"; do
+        local port="${spec%%:*}"
+        local name="${spec##*:}"
+        local log="/tmp/hyper-proxy-tool-${name}.log"
+
+        (
+            cd "$SCRIPT_DIR"
+            GRPC_PORT="$port" GRPC_NAME="$name" node "$SCRIPT_DIR/grpc-server.js"
+        ) > "$log" 2>&1 &
+        local pid=$!
+
+        sleep 0.5
+        if kill -0 "$pid" 2>/dev/null; then
+            GRPC_UPSTREAM_PIDS="$GRPC_UPSTREAM_PIDS $pid"
+            started=$((started + 1))
+            continue
+        fi
+
+        if grep -qi "EADDRINUSE" "$log"; then
+            print_pass "本地 gRPC h2c 测试上游 ${name} 已运行"
+            continue
+        fi
+
+        print_fail "本地 gRPC h2c 测试上游 ${name} 启动失败"
+        cat "$log"
+    done
+
+    if [ "$started" -gt 0 ]; then
+        print_pass "本地 gRPC h2c 测试上游启动成功"
+    fi
+}
+
+stop_grpc_upstreams() {
+    for pid in $GRPC_UPSTREAM_PIDS; do
+        if kill -0 "$pid" 2>/dev/null; then
+            print_test "停止本地 gRPC h2c 测试上游 (PID: $pid)..."
+            {
+                kill "$pid" || true
+                sleep 0.2
+                kill -9 "$pid" || true
+                wait "$pid" || true
+            } 2>/dev/null
+        fi
+    done
+    GRPC_UPSTREAM_PIDS=""
+}
+
 start_wt_upstream() {
     if ! is_local_server_url; then
         return 0
@@ -230,7 +291,7 @@ start_server() {
     cd "$SCRIPT_DIR"
 
     # 启动 cargo run，后台运行
-    cargo run -- --config config.toml > /tmp/hyper-proxy-tool.log 2>&1 &
+    RUST_LOG="${PROXY_RUST_LOG:-hyper_proxy_tool=info}" cargo run -- --config config.toml > /tmp/hyper-proxy-tool.log 2>&1 &
     SERVER_PID=$!
 
     echo "服务器进程 PID: $SERVER_PID"
@@ -678,6 +739,83 @@ print(jwt.encode(payload, 'a-string-secret-at-least-256-bits-long', algorithm='H
     sleep 2
 }
 
+grpc_proxy_request() {
+    local path="$1"
+
+    if ! command -v node &> /dev/null; then
+        return 2
+    fi
+
+    SERVER_URL="${SERVER_URL/localhost/127.0.0.1}" node "$SCRIPT_DIR/test_grpc_client.js" "$path"
+}
+
+test_grpc_unary_load_balancing() {
+    print_test "测试 gRPC over HTTP/2 h2c 代理与负载均衡"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v node &> /dev/null; then
+        print_skip "需要 node 来运行 gRPC h2c 集成测试"
+        return
+    fi
+
+    local seen_a=0
+    local seen_b=0
+    local response=""
+
+    for _ in {1..6}; do
+        response=$(grpc_proxy_request "/helloworld.Greeter/SayHello" 2>/tmp/hyper-proxy-tool-grpc-client.log || true)
+        if echo "$response" | grep -q "grpc-a"; then
+            seen_a=1
+        fi
+        if echo "$response" | grep -q "grpc-b"; then
+            seen_b=1
+        fi
+        if [ "$seen_a" = "1" ] && [ "$seen_b" = "1" ]; then
+            print_pass "gRPC unary 请求通过代理并命中两个上游"
+            return
+        fi
+        sleep 0.2
+    done
+
+    print_fail "gRPC 负载均衡未命中两个上游，最后响应: $response"
+    cat /tmp/hyper-proxy-tool-grpc-client.log 2>/dev/null || true
+}
+
+test_grpc_streaming_timeout_bypass() {
+    print_test "测试 gRPC 流式请求不受 10 秒 HTTP 超时影响"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v node &> /dev/null; then
+        print_skip "需要 node 来运行 gRPC h2c 集成测试"
+        return
+    fi
+
+    local start_ts
+    local end_ts
+    local elapsed
+    local response
+
+    start_ts=$(date +%s)
+    response=$(grpc_proxy_request "/helloworld.Greeter/Slow" 2>/tmp/hyper-proxy-tool-grpc-slow.log || true)
+    end_ts=$(date +%s)
+    elapsed=$((end_ts - start_ts))
+
+    if echo "$response" | grep -Eq "grpc-(a|b):slow" && [ "$elapsed" -ge 10 ]; then
+        print_pass "gRPC 长耗时请求超过 10 秒后仍正常返回"
+    else
+        print_fail "gRPC 长耗时请求应超过 10 秒并成功返回，耗时 ${elapsed}s，响应: $response"
+        cat /tmp/hyper-proxy-tool-grpc-slow.log 2>/dev/null || true
+    fi
+}
+
 # 测试 Alt-Svc 头
 test_alt_svc() {
     print_test "测试 Alt-Svc 头 (HTTP/3 支持)"
@@ -1058,6 +1196,7 @@ fi
 
 cleanup() {
     stop_wt_upstream
+    stop_grpc_upstreams
     stop_local_upstream
     if [ "$STOP_AFTER_TEST" = true ]; then
         stop_server
@@ -1073,6 +1212,7 @@ main() {
     echo "自动启动: $AUTO_START"
 
     start_local_upstream
+    start_grpc_upstreams
 
     # 检查或启动服务器
     if [ "$AUTO_START" = true ]; then
@@ -1115,6 +1255,11 @@ main() {
     # 上游韧性治理测试
     print_header "上游韧性治理测试"
     test_resilience_timeout
+
+    # gRPC 测试
+    print_header "gRPC 测试"
+    test_grpc_unary_load_balancing
+    test_grpc_streaming_timeout_bypass
 
     # HTTP/3 测试
     print_header "HTTP/3 测试"

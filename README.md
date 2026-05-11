@@ -15,6 +15,7 @@ A high-performance, feature-rich proxy service implemented in Rust 2024.
 ### Features
 
 - **Multi-Protocol Support**: HTTP/1.1, HTTP/2, and HTTP/3.
+- **gRPC Proxying**: HTTP/2 gRPC routing and load balancing to h2c upstreams.
 - **Advanced Upgrades**: Seamless handling of WebSocket and WebTransport.
 - **TLS & ACME**: Automated certificate management.
 - **Observability**: Built-in metrics and telemetry integration.
@@ -41,6 +42,7 @@ cargo run -- --config config.toml
 The project includes several utility scripts for testing:
 
 - `./test.sh`: Main integration test suite.
+- `node grpc-server.js`: gRPC h2c upstream server for local proxy tests.
 - `uv run test_webtransport.py`: WebTransport client test.
 - `uv run test_wt_upstream.py`: WebTransport echo upstream server.
 - `node ws-server.js`: WebSocket upstream server for testing.
@@ -63,6 +65,7 @@ The project includes several utility scripts for testing:
 ### 功能特性
 
 - **多协议支持**: 全面支持 HTTP/1.1, HTTP/2 和 HTTP/3。
+- **gRPC 代理**: 支持基于 HTTP/2 的 gRPC 路由与 h2c 上游负载均衡。
 - **协议升级**: 无缝处理 WebSocket 和 WebTransport 连接。
 - **TLS 与 ACME**: 自动化的证书管理与配置。
 - **可观测性**: 内置指标（Metrics）采集与遥测（Telemetry）集成。
@@ -89,6 +92,7 @@ cargo run -- --config config.toml
 项目提供了多个脚本用于功能验证：
 
 - `./test.sh`: 完整的集成测试套件。
+- `node grpc-server.js`: 本地 gRPC h2c 上游测试服务器。
 - `uv run test_webtransport.py`: WebTransport 客户端测试脚本。
 - `uv run test_wt_upstream.py`: WebTransport Echo 上游测试服务器。
 - `node ws-server.js`: 用于测试的 WebSocket 上游服务器。
@@ -99,6 +103,22 @@ cargo run -- --config config.toml
 - `monitor/`: 监控面板相关资源。
 - `config.toml`: 示例配置文件。
 - `gateway_plugin.wasm`: 示例 WASM 插件。
+
+### gRPC h2c 配置示例
+
+gRPC v1 支持显式 `grpc = true` 的 HTTP/2 路由，并使用 HTTP/2 prior knowledge 转发到 `http://` h2c 上游。当前普通健康检查使用 HTTP `HEAD`，通常不适合 gRPC 服务，因此建议为 gRPC upstream 设置 `health_check = false`。
+
+```toml
+[upstreams.grpc_backend]
+urls = ["http://127.0.0.1:50051", "http://127.0.0.1:50052"]
+health_check = false
+
+[[routes]]
+path = "/helloworld.Greeter"
+upstream = "grpc_backend"
+grpc = true
+strip_prefix = false
+```
 
 ---
 

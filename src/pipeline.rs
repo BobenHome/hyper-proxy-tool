@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use hyper::header::AUTHORIZATION;
+use hyper::header::{AUTHORIZATION, CONTENT_TYPE};
 use hyper::{HeaderMap, Method, StatusCode, Uri};
 
 use crate::auth::{self, Claims};
@@ -15,6 +15,7 @@ pub enum ProtocolKind {
     Http1,
     Http2,
     Http3,
+    Grpc,
     WebSocket,
     WebTransport,
 }
@@ -45,6 +46,8 @@ pub enum RejectReason {
     PluginDenied,
     UpstreamNotFound,
     NoHealthyUpstream,
+    GrpcInvalidProtocol,
+    GrpcInvalidContentType,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +108,10 @@ pub fn evaluate_request(
         }
     };
 
+    if let Err(reject) = check_grpc_route(ctx, &route) {
+        return PipelineDecision::Reject(reject);
+    }
+
     if let Err(reject) = check_route_limit(&route, state) {
         return PipelineDecision::Reject(reject);
     }
@@ -135,15 +142,21 @@ pub fn evaluate_request(
         .to_string();
     let final_path = strip_route_prefix(&path_query, &route);
     let request_has_auth = route.auth || ctx.headers.contains_key(AUTHORIZATION);
+    let protocol = if route.grpc {
+        ProtocolKind::Grpc
+    } else {
+        ctx.protocol
+    };
     let cache_key = build_cache_key(
         &target_upstream_name,
         ctx.method,
         &path_query,
         request_has_auth,
+        route.grpc,
     );
 
     PipelineDecision::Forward(Box::new(ForwardPlan {
-        protocol: ctx.protocol,
+        protocol,
         resilience: route.resilience.clone().unwrap_or_default(),
         route,
         claims,
@@ -167,6 +180,32 @@ fn check_ip_limit(ctx: &RequestContext<'_>, state: &AppState) -> Result<(), Pipe
             reason: RejectReason::IpRateLimited,
             message: "429 Too Many Requests (IP)".to_string(),
             metrics_upstream: "ip_limit".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn check_grpc_route(ctx: &RequestContext<'_>, route: &RouteConfig) -> Result<(), PipelineReject> {
+    if !route.grpc {
+        return Ok(());
+    }
+
+    if ctx.protocol != ProtocolKind::Http2 {
+        return Err(PipelineReject {
+            status: StatusCode::UPGRADE_REQUIRED,
+            reason: RejectReason::GrpcInvalidProtocol,
+            message: "gRPC routes require HTTP/2".to_string(),
+            metrics_upstream: route.upstream.clone(),
+        });
+    }
+
+    if !is_grpc_content_type(ctx.headers) {
+        return Err(PipelineReject {
+            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            reason: RejectReason::GrpcInvalidContentType,
+            message: "gRPC routes require content-type application/grpc".to_string(),
+            metrics_upstream: route.upstream.clone(),
         });
     }
 
@@ -318,8 +357,9 @@ fn build_cache_key(
     method: &Method,
     path_query: &str,
     request_has_auth: bool,
+    is_grpc: bool,
 ) -> Option<String> {
-    if request_has_auth || method != Method::GET {
+    if request_has_auth || is_grpc || method != Method::GET {
         return None;
     }
 
@@ -327,6 +367,14 @@ fn build_cache_key(
         "{}:{}:{}",
         target_upstream_name, method, path_query
     ))
+}
+
+pub fn is_grpc_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .is_some_and(|value| value.starts_with("application/grpc"))
 }
 
 pub fn path_matches_route(path: &str, route_path: &str) -> bool {
@@ -365,7 +413,9 @@ pub fn strip_route_prefix(path_query: &str, route: &RouteConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RouteConfig;
+    use crate::config::{AppConfig, RouteConfig, ServerConfig, UpstreamConfig};
+    use hyper::header::HeaderValue;
+    use std::collections::HashMap;
 
     fn route(path: &str, strip_prefix: bool) -> RouteConfig {
         RouteConfig {
@@ -377,8 +427,61 @@ mod tests {
             canary: None,
             plugin: None,
             webtransport: false,
+            grpc: false,
             resilience: None,
         }
+    }
+
+    fn grpc_route(path: &str) -> RouteConfig {
+        let mut route = route(path, false);
+        route.grpc = true;
+        route
+    }
+
+    fn config_with_routes(routes: Vec<RouteConfig>) -> AppConfig {
+        let mut upstreams = HashMap::new();
+        upstreams.insert(
+            "stable".to_string(),
+            UpstreamConfig {
+                urls: vec!["http://127.0.0.1:50051".to_string()],
+                health_check: false,
+            },
+        );
+
+        AppConfig {
+            server: ServerConfig {
+                listen_addr: "127.0.0.1:0".to_string(),
+                cert_file: "cert.pem".to_string(),
+                key_file: "key.pem".to_string(),
+                ip_limit: None,
+                tracing: None,
+                acme: None,
+                jwt_secret: None,
+            },
+            upstreams,
+            routes,
+        }
+    }
+
+    fn evaluate_test_request(
+        route: RouteConfig,
+        protocol: ProtocolKind,
+        method: Method,
+        path: &str,
+        headers: HeaderMap,
+    ) -> PipelineDecision {
+        let config = Arc::new(config_with_routes(vec![route]));
+        let state = AppState::from_config(&config);
+        let uri = path.parse::<Uri>().unwrap();
+        let ctx = RequestContext {
+            protocol,
+            method: &method,
+            uri: &uri,
+            headers: &headers,
+            remote_addr: "127.0.0.1:12345".parse().unwrap(),
+        };
+
+        evaluate_request(&ctx, config, &state)
     }
 
     #[test]
@@ -414,5 +517,106 @@ mod tests {
 
         let matched = find_matching_route("/api/v1/users", &routes).unwrap();
         assert_eq!(matched.path, "/api/v1");
+    }
+
+    #[test]
+    fn matches_grpc_service_method_route() {
+        let routes = vec![
+            route("/helloworld", false),
+            route("/helloworld.Greeter", false),
+        ];
+
+        let matched = find_matching_route("/helloworld.Greeter/SayHello", &routes).unwrap();
+        assert_eq!(matched.path, "/helloworld.Greeter");
+    }
+
+    #[test]
+    fn detects_grpc_content_type_with_suffix_and_params() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/grpc+proto; charset=utf-8"),
+        );
+
+        assert!(is_grpc_content_type(&headers));
+    }
+
+    #[test]
+    fn rejects_grpc_route_without_http2() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/grpc"));
+
+        let decision = evaluate_test_request(
+            grpc_route("/helloworld.Greeter"),
+            ProtocolKind::Http1,
+            Method::POST,
+            "/helloworld.Greeter/SayHello",
+            headers,
+        );
+
+        match decision {
+            PipelineDecision::Reject(reject) => {
+                assert_eq!(reject.reason, RejectReason::GrpcInvalidProtocol);
+                assert_eq!(reject.status, StatusCode::UPGRADE_REQUIRED);
+            }
+            _ => panic!("expected gRPC protocol rejection"),
+        }
+    }
+
+    #[test]
+    fn rejects_grpc_route_without_grpc_content_type() {
+        let headers = HeaderMap::new();
+
+        let decision = evaluate_test_request(
+            grpc_route("/helloworld.Greeter"),
+            ProtocolKind::Http2,
+            Method::POST,
+            "/helloworld.Greeter/SayHello",
+            headers,
+        );
+
+        match decision {
+            PipelineDecision::Reject(reject) => {
+                assert_eq!(reject.reason, RejectReason::GrpcInvalidContentType);
+                assert_eq!(reject.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            }
+            _ => panic!("expected gRPC content-type rejection"),
+        }
+    }
+
+    #[test]
+    fn forwards_grpc_route_as_grpc_without_cache_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/grpc"));
+
+        let decision = evaluate_test_request(
+            grpc_route("/helloworld.Greeter"),
+            ProtocolKind::Http2,
+            Method::POST,
+            "/helloworld.Greeter/SayHello",
+            headers,
+        );
+
+        match decision {
+            PipelineDecision::Forward(plan) => {
+                assert_eq!(plan.protocol, ProtocolKind::Grpc);
+                assert!(plan.cache_key.is_none());
+            }
+            _ => panic!("expected gRPC forward plan"),
+        }
+    }
+
+    #[test]
+    fn grpc_requests_do_not_build_cache_keys() {
+        assert_eq!(
+            build_cache_key(
+                "stable",
+                &Method::GET,
+                "/helloworld.Greeter/SayHello",
+                false,
+                true
+            ),
+            None
+        );
     }
 }

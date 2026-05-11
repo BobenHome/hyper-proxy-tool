@@ -77,6 +77,8 @@ pub struct RouteConfig {
     pub plugin: Option<String>,
     #[serde(default)]
     pub webtransport: bool,
+    #[serde(default)]
+    pub grpc: bool,
     pub resilience: Option<ResilienceConfig>,
 }
 

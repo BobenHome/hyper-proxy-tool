@@ -39,6 +39,12 @@ endpoint = "http://localhost:4317"
   [upstreams.canary]
   urls = ["http://127.0.0.1:9443"]
 
+  # 本地 gRPC h2c 上游，用于测试 HTTP/2 prior knowledge 代理。
+  # gRPC 服务通常不支持普通 HEAD 健康检查，因此 v1 示例关闭 health_check。
+  [upstreams.grpc_backend]
+  urls = ["http://127.0.0.1:50051", "http://127.0.0.1:50052"]
+  health_check = false
+
   # 本地 WS 上游
   # [upstreams.local_ws]
   # 注意：虽然是 WebSocket，但底层建立连接时是 TCP/HTTP，
@@ -96,6 +102,12 @@ webtransport = true
   circuit_breaker_reset_ms = 1000
   fallback_status = 503
   fallback_body = "upstream temporarily unavailable"
+
+[[routes]]
+path = "/helloworld.Greeter"
+upstream = "grpc_backend"
+strip_prefix = false
+grpc = true
 
 # [[routes]]
 # path = "/ws"
