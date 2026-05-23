@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyper::header::{AUTHORIZATION, CONTENT_TYPE};
 use hyper::{HeaderMap, Method, StatusCode, Uri};
 
 use crate::auth::{self, Claims};
-use crate::config::{AppConfig, ResilienceConfig, RouteConfig};
+use crate::config::{AppConfig, GrpcRetryMode, GrpcRouteConfig, ResilienceConfig, RouteConfig};
+use crate::grpc;
 use crate::plugin::{WasmInput, WasmOutput};
 use crate::state::{AppState, UpstreamState};
 
@@ -48,6 +50,33 @@ pub enum RejectReason {
     NoHealthyUpstream,
     GrpcInvalidProtocol,
     GrpcInvalidContentType,
+    GrpcInvalidPath,
+}
+
+impl RejectReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RouteNotFound => "route_not_found",
+            Self::IpRateLimited => "ip_rate_limited",
+            Self::RouteRateLimited => "route_rate_limited",
+            Self::AuthMissing => "auth_missing",
+            Self::AuthInvalidScheme => "auth_invalid_scheme",
+            Self::AuthInvalidToken => "auth_invalid_token",
+            Self::AuthConfigError => "auth_config_error",
+            Self::PluginDenied => "plugin_denied",
+            Self::UpstreamNotFound => "upstream_not_found",
+            Self::NoHealthyUpstream => "no_healthy_upstream",
+            Self::GrpcInvalidProtocol => "grpc_invalid_protocol",
+            Self::GrpcInvalidContentType => "grpc_invalid_content_type",
+            Self::GrpcInvalidPath => "grpc_invalid_path",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectResponseKind {
+    Http,
+    Grpc,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +85,7 @@ pub struct PipelineReject {
     pub reason: RejectReason,
     pub message: String,
     pub metrics_upstream: String,
+    pub response_kind: RejectResponseKind,
 }
 
 #[derive(Clone)]
@@ -72,6 +102,12 @@ pub struct ForwardPlan {
     pub cache_key: Option<String>,
     pub is_canary: bool,
     pub resilience: ResilienceConfig,
+    pub grpc_service: Option<String>,
+    pub grpc_method: Option<String>,
+    pub grpc_timeout: Option<Duration>,
+    pub grpc_config: Option<GrpcRouteConfig>,
+    pub grpc_transport_validated: bool,
+    pub grpc_retry_eligible: bool,
 }
 
 #[derive(Clone)]
@@ -99,29 +135,54 @@ pub fn evaluate_request(
     let route = match find_matching_route(path, &app_config.routes) {
         Some(route) => route.clone(),
         None => {
-            return PipelineDecision::Reject(PipelineReject {
-                status: StatusCode::NOT_FOUND,
-                reason: RejectReason::RouteNotFound,
-                message: "404 Not Found".to_string(),
-                metrics_upstream: "unknown".to_string(),
-            });
+            return PipelineDecision::Reject(make_reject(
+                StatusCode::NOT_FOUND,
+                RejectReason::RouteNotFound,
+                "404 Not Found",
+                "unknown",
+                RejectResponseKind::Http,
+            ));
         }
     };
 
-    if let Err(reject) = check_grpc_route(ctx, &route) {
+    let grpc_transport_validated = match check_grpc_route(ctx, &route) {
+        Ok(v) => v,
+        Err(reject) => return PipelineDecision::Reject(reject),
+    };
+
+    let grpc_path_parts = if route.grpc {
+        match grpc::parse_grpc_path(path) {
+            Some(parts) => Some(parts),
+            None => {
+                return PipelineDecision::Reject(make_reject(
+                    StatusCode::BAD_REQUEST,
+                    RejectReason::GrpcInvalidPath,
+                    "gRPC routes require /Service/Method path",
+                    route.upstream.clone(),
+                    RejectResponseKind::Http,
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    let response_kind = if route.grpc && grpc_transport_validated && grpc_path_parts.is_some() {
+        RejectResponseKind::Grpc
+    } else {
+        RejectResponseKind::Http
+    };
+
+    if let Err(reject) = check_route_limit(&route, state, response_kind) {
         return PipelineDecision::Reject(reject);
     }
 
-    if let Err(reject) = check_route_limit(&route, state) {
-        return PipelineDecision::Reject(reject);
-    }
-
-    let claims = match check_auth(ctx.headers, &route, state) {
+    let claims = match check_auth(ctx.headers, &route, state, response_kind) {
         Ok(claims) => claims,
         Err(reject) => return PipelineDecision::Reject(reject),
     };
 
-    if let Err(reject) = run_plugin(path, ctx.headers, &route, state) {
+    if let Err(reject) = run_plugin(path, ctx.headers, &route, state, response_kind) {
         return PipelineDecision::Reject(reject);
     }
 
@@ -129,10 +190,11 @@ pub fn evaluate_request(
         crate::canary::select_target_upstream(ctx.headers, &route);
     let target_upstream_name = target_upstream_name.to_string();
 
-    let (upstream_state, active_urls) = match resolve_upstream(&target_upstream_name, state) {
-        Ok(v) => v,
-        Err(reject) => return PipelineDecision::Reject(reject),
-    };
+    let (upstream_state, active_urls) =
+        match resolve_upstream(&target_upstream_name, state, response_kind) {
+            Ok(v) => v,
+            Err(reject) => return PipelineDecision::Reject(reject),
+        };
 
     let path_query = ctx
         .uri
@@ -147,6 +209,20 @@ pub fn evaluate_request(
     } else {
         ctx.protocol
     };
+    let grpc_timeout = if route.grpc {
+        grpc::parse_grpc_timeout(ctx.headers)
+    } else {
+        None
+    };
+    let grpc_config = route
+        .grpc
+        .then(|| route.grpc_config.clone().unwrap_or_default());
+    let grpc_retry_eligible = route.grpc
+        && route.path == path
+        && matches!(
+            grpc_config.as_ref().map(|cfg| cfg.retry_mode),
+            Some(GrpcRetryMode::SafeUnary)
+        );
     let cache_key = build_cache_key(
         &target_upstream_name,
         ctx.method,
@@ -168,6 +244,12 @@ pub fn evaluate_request(
         request_has_auth,
         cache_key,
         is_canary,
+        grpc_service: grpc_path_parts.as_ref().map(|parts| parts.service.clone()),
+        grpc_method: grpc_path_parts.as_ref().map(|parts| parts.method.clone()),
+        grpc_timeout,
+        grpc_config,
+        grpc_transport_validated,
+        grpc_retry_eligible,
     }))
 }
 
@@ -175,54 +257,62 @@ fn check_ip_limit(ctx: &RequestContext<'_>, state: &AppState) -> Result<(), Pipe
     if let Some(limiter) = &**state.ip_limiter.load()
         && limiter.check_key(&ctx.remote_addr.ip()).is_err()
     {
-        return Err(PipelineReject {
-            status: StatusCode::TOO_MANY_REQUESTS,
-            reason: RejectReason::IpRateLimited,
-            message: "429 Too Many Requests (IP)".to_string(),
-            metrics_upstream: "ip_limit".to_string(),
-        });
+        return Err(make_reject(
+            StatusCode::TOO_MANY_REQUESTS,
+            RejectReason::IpRateLimited,
+            "429 Too Many Requests (IP)",
+            "ip_limit",
+            RejectResponseKind::Http,
+        ));
     }
 
     Ok(())
 }
 
-fn check_grpc_route(ctx: &RequestContext<'_>, route: &RouteConfig) -> Result<(), PipelineReject> {
+fn check_grpc_route(ctx: &RequestContext<'_>, route: &RouteConfig) -> Result<bool, PipelineReject> {
     if !route.grpc {
-        return Ok(());
+        return Ok(false);
     }
 
     if ctx.protocol != ProtocolKind::Http2 {
-        return Err(PipelineReject {
-            status: StatusCode::UPGRADE_REQUIRED,
-            reason: RejectReason::GrpcInvalidProtocol,
-            message: "gRPC routes require HTTP/2".to_string(),
-            metrics_upstream: route.upstream.clone(),
-        });
+        return Err(make_reject(
+            StatusCode::UPGRADE_REQUIRED,
+            RejectReason::GrpcInvalidProtocol,
+            "gRPC routes require HTTP/2",
+            route.upstream.clone(),
+            RejectResponseKind::Http,
+        ));
     }
 
     if !is_grpc_content_type(ctx.headers) {
-        return Err(PipelineReject {
-            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            reason: RejectReason::GrpcInvalidContentType,
-            message: "gRPC routes require content-type application/grpc".to_string(),
-            metrics_upstream: route.upstream.clone(),
-        });
+        return Err(make_reject(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            RejectReason::GrpcInvalidContentType,
+            "gRPC routes require content-type application/grpc",
+            route.upstream.clone(),
+            RejectResponseKind::Http,
+        ));
     }
 
-    Ok(())
+    Ok(true)
 }
 
-fn check_route_limit(route: &RouteConfig, state: &AppState) -> Result<(), PipelineReject> {
+fn check_route_limit(
+    route: &RouteConfig,
+    state: &AppState,
+    response_kind: RejectResponseKind,
+) -> Result<(), PipelineReject> {
     let route_limiters = state.route_limiters.load();
     if let Some(limiter) = route_limiters.get(&route.path)
         && limiter.check().is_err()
     {
-        return Err(PipelineReject {
-            status: StatusCode::TOO_MANY_REQUESTS,
-            reason: RejectReason::RouteRateLimited,
-            message: "429 Too Many Requests (Route)".to_string(),
-            metrics_upstream: "route_limit".to_string(),
-        });
+        return Err(make_reject(
+            StatusCode::TOO_MANY_REQUESTS,
+            RejectReason::RouteRateLimited,
+            "429 Too Many Requests (Route)",
+            "route_limit",
+            response_kind,
+        ));
     }
 
     Ok(())
@@ -232,35 +322,40 @@ fn check_auth(
     headers: &HeaderMap,
     route: &RouteConfig,
     state: &AppState,
+    response_kind: RejectResponseKind,
 ) -> Result<Option<Claims>, PipelineReject> {
     let jwt_key_guard = state.jwt_key.load();
 
     match auth::validate_auth_headers(headers, route, &jwt_key_guard) {
         Ok(claims) => Ok(claims),
-        Err(auth::AuthError::MissingHeader) => Err(PipelineReject {
-            status: StatusCode::UNAUTHORIZED,
-            reason: RejectReason::AuthMissing,
-            message: "Missing Authorization Header".to_string(),
-            metrics_upstream: route.upstream.clone(),
-        }),
-        Err(auth::AuthError::InvalidScheme) => Err(PipelineReject {
-            status: StatusCode::UNAUTHORIZED,
-            reason: RejectReason::AuthInvalidScheme,
-            message: "Invalid Auth Scheme".to_string(),
-            metrics_upstream: route.upstream.clone(),
-        }),
-        Err(auth::AuthError::InvalidToken) => Err(PipelineReject {
-            status: StatusCode::UNAUTHORIZED,
-            reason: RejectReason::AuthInvalidToken,
-            message: "Invalid Token".to_string(),
-            metrics_upstream: route.upstream.clone(),
-        }),
-        Err(auth::AuthError::ConfigError) => Err(PipelineReject {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            reason: RejectReason::AuthConfigError,
-            message: "Auth Configuration Error".to_string(),
-            metrics_upstream: route.upstream.clone(),
-        }),
+        Err(auth::AuthError::MissingHeader) => Err(make_reject(
+            StatusCode::UNAUTHORIZED,
+            RejectReason::AuthMissing,
+            "Missing Authorization Header",
+            route.upstream.clone(),
+            response_kind,
+        )),
+        Err(auth::AuthError::InvalidScheme) => Err(make_reject(
+            StatusCode::UNAUTHORIZED,
+            RejectReason::AuthInvalidScheme,
+            "Invalid Auth Scheme",
+            route.upstream.clone(),
+            response_kind,
+        )),
+        Err(auth::AuthError::InvalidToken) => Err(make_reject(
+            StatusCode::UNAUTHORIZED,
+            RejectReason::AuthInvalidToken,
+            "Invalid Token",
+            route.upstream.clone(),
+            response_kind,
+        )),
+        Err(auth::AuthError::ConfigError) => Err(make_reject(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            RejectReason::AuthConfigError,
+            "Auth Configuration Error",
+            route.upstream.clone(),
+            response_kind,
+        )),
     }
 }
 
@@ -269,6 +364,7 @@ fn run_plugin(
     headers: &HeaderMap,
     route: &RouteConfig,
     state: &AppState,
+    response_kind: RejectResponseKind,
 ) -> Result<(), PipelineReject> {
     let Some(plugin_path) = &route.plugin else {
         return Ok(());
@@ -308,12 +404,13 @@ fn run_plugin(
     };
 
     match serde_json::from_str::<WasmOutput>(&output_json) {
-        Ok(decision) if !decision.allow => Err(PipelineReject {
-            status: StatusCode::from_u16(decision.status_code).unwrap_or(StatusCode::FORBIDDEN),
-            reason: RejectReason::PluginDenied,
-            message: decision.body,
-            metrics_upstream: route.upstream.clone(),
-        }),
+        Ok(decision) if !decision.allow => Err(make_reject(
+            StatusCode::from_u16(decision.status_code).unwrap_or(StatusCode::FORBIDDEN),
+            RejectReason::PluginDenied,
+            decision.body,
+            route.upstream.clone(),
+            response_kind,
+        )),
         Ok(_) => Ok(()),
         Err(err) => {
             tracing::error!("Failed to parse Wasm output: {}", err);
@@ -325,31 +422,50 @@ fn run_plugin(
 fn resolve_upstream(
     target_upstream_name: &str,
     state: &AppState,
+    response_kind: RejectResponseKind,
 ) -> Result<(Arc<UpstreamState>, Vec<String>), PipelineReject> {
     let current_state_map = state.upstreams.load();
     let upstream_state = match current_state_map.get(target_upstream_name) {
         Some(state) => state.clone(),
         None => {
-            return Err(PipelineReject {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                reason: RejectReason::UpstreamNotFound,
-                message: "500 Config Error".to_string(),
-                metrics_upstream: target_upstream_name.to_string(),
-            });
+            return Err(make_reject(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                RejectReason::UpstreamNotFound,
+                "500 Config Error",
+                target_upstream_name.to_string(),
+                response_kind,
+            ));
         }
     };
 
     let active_urls = (*upstream_state.active_urls.load_full()).clone();
     if active_urls.is_empty() {
-        return Err(PipelineReject {
-            status: StatusCode::BAD_GATEWAY,
-            reason: RejectReason::NoHealthyUpstream,
-            message: "502 Bad Gateway (No Healthy Nodes)".to_string(),
-            metrics_upstream: target_upstream_name.to_string(),
-        });
+        return Err(make_reject(
+            StatusCode::BAD_GATEWAY,
+            RejectReason::NoHealthyUpstream,
+            "502 Bad Gateway (No Healthy Nodes)",
+            target_upstream_name.to_string(),
+            response_kind,
+        ));
     }
 
     Ok((upstream_state, active_urls))
+}
+
+fn make_reject(
+    status: StatusCode,
+    reason: RejectReason,
+    message: impl Into<String>,
+    metrics_upstream: impl Into<String>,
+    response_kind: RejectResponseKind,
+) -> PipelineReject {
+    PipelineReject {
+        status,
+        reason,
+        message: message.into(),
+        metrics_upstream: metrics_upstream.into(),
+        response_kind,
+    }
 }
 
 fn build_cache_key(
@@ -428,6 +544,7 @@ mod tests {
             plugin: None,
             webtransport: false,
             grpc: false,
+            grpc_config: None,
             resilience: None,
         }
     }
@@ -438,6 +555,12 @@ mod tests {
         route
     }
 
+    fn grpc_route_with_upstream(path: &str, upstream: &str) -> RouteConfig {
+        let mut route = grpc_route(path);
+        route.upstream = upstream.to_string();
+        route
+    }
+
     fn config_with_routes(routes: Vec<RouteConfig>) -> AppConfig {
         let mut upstreams = HashMap::new();
         upstreams.insert(
@@ -445,6 +568,7 @@ mod tests {
             UpstreamConfig {
                 urls: vec!["http://127.0.0.1:50051".to_string()],
                 health_check: false,
+                health: None,
             },
         );
 
@@ -558,6 +682,7 @@ mod tests {
             PipelineDecision::Reject(reject) => {
                 assert_eq!(reject.reason, RejectReason::GrpcInvalidProtocol);
                 assert_eq!(reject.status, StatusCode::UPGRADE_REQUIRED);
+                assert_eq!(reject.response_kind, RejectResponseKind::Http);
             }
             _ => panic!("expected gRPC protocol rejection"),
         }
@@ -579,8 +704,32 @@ mod tests {
             PipelineDecision::Reject(reject) => {
                 assert_eq!(reject.reason, RejectReason::GrpcInvalidContentType);
                 assert_eq!(reject.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+                assert_eq!(reject.response_kind, RejectResponseKind::Http);
             }
             _ => panic!("expected gRPC content-type rejection"),
+        }
+    }
+
+    #[test]
+    fn rejects_grpc_route_without_service_method_path() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/grpc"));
+
+        let decision = evaluate_test_request(
+            grpc_route("/helloworld.Greeter"),
+            ProtocolKind::Http2,
+            Method::POST,
+            "/helloworld.Greeter",
+            headers,
+        );
+
+        match decision {
+            PipelineDecision::Reject(reject) => {
+                assert_eq!(reject.reason, RejectReason::GrpcInvalidPath);
+                assert_eq!(reject.status, StatusCode::BAD_REQUEST);
+                assert_eq!(reject.response_kind, RejectResponseKind::Http);
+            }
+            _ => panic!("expected gRPC path rejection"),
         }
     }
 
@@ -588,6 +737,7 @@ mod tests {
     fn forwards_grpc_route_as_grpc_without_cache_key() {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/grpc"));
+        headers.insert("grpc-timeout", HeaderValue::from_static("3S"));
 
         let decision = evaluate_test_request(
             grpc_route("/helloworld.Greeter"),
@@ -601,8 +751,41 @@ mod tests {
             PipelineDecision::Forward(plan) => {
                 assert_eq!(plan.protocol, ProtocolKind::Grpc);
                 assert!(plan.cache_key.is_none());
+                assert_eq!(plan.grpc_service.as_deref(), Some("helloworld.Greeter"));
+                assert_eq!(plan.grpc_method.as_deref(), Some("SayHello"));
+                assert_eq!(plan.grpc_timeout, Some(Duration::from_secs(3)));
+                assert!(plan.grpc_transport_validated);
+                assert!(!plan.grpc_retry_eligible);
+                assert_eq!(
+                    plan.grpc_config
+                        .as_ref()
+                        .map(|cfg| cfg.respect_grpc_timeout),
+                    Some(true)
+                );
             }
             _ => panic!("expected gRPC forward plan"),
+        }
+    }
+
+    #[test]
+    fn grpc_rejects_after_transport_validation_use_grpc_response_kind() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/grpc"));
+
+        let decision = evaluate_test_request(
+            grpc_route_with_upstream("/helloworld.Greeter", "missing"),
+            ProtocolKind::Http2,
+            Method::POST,
+            "/helloworld.Greeter/SayHello",
+            headers,
+        );
+
+        match decision {
+            PipelineDecision::Reject(reject) => {
+                assert_eq!(reject.reason, RejectReason::UpstreamNotFound);
+                assert_eq!(reject.response_kind, RejectResponseKind::Grpc);
+            }
+            _ => panic!("expected upstream-not-found gRPC rejection"),
         }
     }
 
@@ -618,5 +801,55 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn exact_method_grpc_route_is_retry_eligible_when_safe_unary_enabled() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/grpc"));
+
+        let mut route = grpc_route("/retry.Greeter/SayHello");
+        route.grpc_config = Some(GrpcRouteConfig {
+            retry_mode: GrpcRetryMode::SafeUnary,
+            ..GrpcRouteConfig::default()
+        });
+
+        let decision = evaluate_test_request(
+            route,
+            ProtocolKind::Http2,
+            Method::POST,
+            "/retry.Greeter/SayHello",
+            headers,
+        );
+
+        match decision {
+            PipelineDecision::Forward(plan) => assert!(plan.grpc_retry_eligible),
+            _ => panic!("expected gRPC forward plan"),
+        }
+    }
+
+    #[test]
+    fn service_level_grpc_route_is_not_retry_eligible() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/grpc"));
+
+        let mut route = grpc_route("/retry.Greeter");
+        route.grpc_config = Some(GrpcRouteConfig {
+            retry_mode: GrpcRetryMode::SafeUnary,
+            ..GrpcRouteConfig::default()
+        });
+
+        let decision = evaluate_test_request(
+            route,
+            ProtocolKind::Http2,
+            Method::POST,
+            "/retry.Greeter/SayHello",
+            headers,
+        );
+
+        match decision {
+            PipelineDecision::Forward(plan) => assert!(!plan.grpc_retry_eligible),
+            _ => panic!("expected gRPC forward plan"),
+        }
     }
 }

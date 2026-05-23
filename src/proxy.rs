@@ -1,25 +1,30 @@
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
-use hyper::body::Incoming;
+use hyper::body::{Body as HyperBody, Frame, Incoming, SizeHint};
 use hyper::header::CONTENT_LENGTH;
 
 use hyper::{Method, Request, Response, StatusCode, Uri, Version};
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
+use tokio::time::Sleep;
 use tracing::{error, info, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::cache::parse_cache_max_age;
 use crate::config::AppConfig;
 use crate::error::ProxyError;
+use crate::grpc::{self, GrpcCode};
 use crate::metrics::{
-    record_metrics, record_upstream_circuit_open, record_upstream_retry, record_upstream_timeout,
+    record_grpc_gateway_reject, record_grpc_request, record_grpc_upstream_status, record_metrics,
+    record_upstream_circuit_open, record_upstream_retry, record_upstream_timeout,
 };
 use crate::pipeline::{
     self, ForwardPlan, LocalReplyKind, PipelineDecision, PipelineReject, ProtocolKind,
-    RequestContext,
+    RejectResponseKind, RequestContext,
 };
 use crate::state::{AppState, HttpClient};
 use crate::telemetry::HeaderInjector;
@@ -35,6 +40,178 @@ struct Http3ProxyRequest {
     remote_addr: SocketAddr,
 }
 
+struct GrpcUnaryRequestContext<'a> {
+    parts: hyper::http::request::Parts,
+    client: Arc<HttpClient>,
+    plan: &'a ForwardPlan,
+    remote_addr: SocketAddr,
+    method_str: &'a str,
+    start: Instant,
+}
+
+struct GrpcObservedBody<B> {
+    inner: B,
+    service: String,
+    method: String,
+    upstream_pool: String,
+    upstream_url: String,
+    start: Instant,
+    emit_metrics: bool,
+    timeout: Option<Pin<Box<Sleep>>>,
+    finalized: bool,
+    observed_outcome: bool,
+}
+
+impl<B> GrpcObservedBody<B> {
+    fn observe_trailers(&mut self, trailers: &hyper::HeaderMap) {
+        if self.observed_outcome {
+            return;
+        }
+
+        self.observed_outcome = true;
+        let grpc_status = grpc::parse_grpc_status(trailers).unwrap_or(-1);
+        let grpc_status_label = grpc::grpc_status_label(grpc_status);
+        let grpc_message = grpc::parse_grpc_message(trailers).unwrap_or_default();
+
+        info!(
+            "gRPC upstream trailers <- upstream={} service={} method={} grpc_status={} grpc_message={}",
+            self.upstream_url, self.service, self.method, grpc_status_label, grpc_message
+        );
+
+        if self.emit_metrics {
+            record_grpc_request(
+                &self.service,
+                &self.method,
+                grpc_status_label,
+                &self.upstream_pool,
+                self.start,
+            );
+            record_grpc_upstream_status(
+                &self.service,
+                &self.method,
+                grpc_status_label,
+                &self.upstream_pool,
+            );
+        }
+    }
+
+    fn observe_gateway_outcome(&mut self, reason: &str, code: GrpcCode, message: &str) {
+        if self.observed_outcome {
+            return;
+        }
+
+        self.observed_outcome = true;
+        info!(
+            "gRPC gateway synthetic trailers <- upstream={} service={} method={} grpc_status={} grpc_message={} reason={}",
+            self.upstream_url,
+            self.service,
+            self.method,
+            code.as_str(),
+            message,
+            reason
+        );
+
+        if self.emit_metrics {
+            record_grpc_gateway_reject(reason, code.as_str(), &self.upstream_pool);
+            record_grpc_request(
+                &self.service,
+                &self.method,
+                code.as_str(),
+                &self.upstream_pool,
+                self.start,
+            );
+        }
+    }
+}
+
+impl<B> HyperBody for GrpcObservedBody<B>
+where
+    B: HyperBody<Data = Bytes, Error = ProxyError> + Unpin,
+{
+    type Data = Bytes;
+    type Error = ProxyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.finalized {
+            return Poll::Ready(None);
+        }
+
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(trailers) = frame.trailers_ref() {
+                    self.observe_trailers(trailers);
+                    self.finalized = true;
+                }
+                return Poll::Ready(Some(Ok(frame)));
+            }
+            Poll::Ready(Some(Err(err))) => {
+                error!("gRPC upstream body read failed: {:?}", err);
+                self.observe_gateway_outcome(
+                    "upstream_body_error",
+                    GrpcCode::Unavailable,
+                    "upstream body read failed",
+                );
+                self.finalized = true;
+                return Poll::Ready(Some(Ok(Frame::trailers(grpc::grpc_trailers(
+                    GrpcCode::Unavailable,
+                    "upstream body read failed",
+                )))));
+            }
+            Poll::Ready(None) => {
+                if !self.observed_outcome {
+                    self.observe_gateway_outcome(
+                        "missing_grpc_trailers",
+                        GrpcCode::Internal,
+                        "missing grpc trailers",
+                    );
+                    self.finalized = true;
+                    return Poll::Ready(Some(Ok(Frame::trailers(grpc::grpc_trailers(
+                        GrpcCode::Internal,
+                        "missing grpc trailers",
+                    )))));
+                }
+                self.finalized = true;
+                return Poll::Ready(None);
+            }
+            Poll::Pending => {}
+        }
+
+        if let Some(timeout) = self.timeout.as_mut()
+            && timeout.as_mut().poll(cx).is_ready()
+        {
+            self.observe_gateway_outcome(
+                "deadline_exceeded_midstream",
+                GrpcCode::DeadlineExceeded,
+                "deadline exceeded",
+            );
+            self.finalized = true;
+            return Poll::Ready(Some(Ok(Frame::trailers(grpc::grpc_trailers(
+                GrpcCode::DeadlineExceeded,
+                "deadline exceeded",
+            )))));
+        }
+
+        Poll::Pending
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.finalized || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+#[derive(Debug)]
+enum UpstreamRequestError {
+    Timeout(Duration),
+    Transport(ProxyError),
+}
+
 pub fn is_grpc_like_request<B>(req: &Request<B>) -> bool {
     req.version() == Version::HTTP_2 && pipeline::is_grpc_content_type(req.headers())
 }
@@ -42,6 +219,13 @@ pub fn is_grpc_like_request<B>(req: &Request<B>) -> bool {
 fn pipeline_reject_to_http_response(
     reject: PipelineReject,
 ) -> Response<BoxBody<Bytes, ProxyError>> {
+    if matches!(reject.response_kind, RejectResponseKind::Grpc) {
+        return grpc::grpc_trailers_only_response(
+            grpc::grpc_code_for_reject(reject.reason),
+            reject.message,
+        );
+    }
+
     let body = Full::new(Bytes::from(reject.message))
         .map_err(|e| match e {})
         .boxed();
@@ -66,6 +250,13 @@ fn pipeline_reject_to_http3_response(
 }
 
 fn fallback_response(plan: &ForwardPlan) -> Response<BoxBody<Bytes, ProxyError>> {
+    if matches!(plan.protocol, ProtocolKind::Grpc) {
+        return grpc::grpc_trailers_only_response(
+            GrpcCode::Unavailable,
+            plan.resilience.fallback_body.clone(),
+        );
+    }
+
     let status =
         StatusCode::from_u16(plan.resilience.fallback_status).unwrap_or(StatusCode::BAD_GATEWAY);
     Response::builder()
@@ -78,8 +269,39 @@ fn fallback_response(plan: &ForwardPlan) -> Response<BoxBody<Bytes, ProxyError>>
         .unwrap()
 }
 
+fn deadline_exceeded_response(
+    plan: &ForwardPlan,
+    timeout: Duration,
+) -> Response<BoxBody<Bytes, ProxyError>> {
+    if matches!(plan.protocol, ProtocolKind::Grpc) {
+        return grpc::grpc_trailers_only_response(
+            GrpcCode::DeadlineExceeded,
+            format!("deadline exceeded after {:?}", timeout),
+        );
+    }
+
+    Response::builder()
+        .status(StatusCode::GATEWAY_TIMEOUT)
+        .body(
+            Full::new(Bytes::from(format!(
+                "504 Gateway Timeout after {:?}",
+                timeout
+            )))
+            .map_err(|e| match e {})
+            .boxed(),
+        )
+        .unwrap()
+}
+
 fn should_retry_status(status: StatusCode) -> bool {
     status.is_server_error()
+}
+
+fn should_retry_grpc_safe_unary_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
+    )
 }
 
 fn max_request_attempts(plan: &ForwardPlan) -> usize {
@@ -87,6 +309,35 @@ fn max_request_attempts(plan: &ForwardPlan) -> usize {
         .len()
         .max(1)
         .saturating_mul(plan.resilience.retry_attempts.max(1))
+}
+
+fn grpc_retry_buffer_limit(plan: &ForwardPlan) -> u64 {
+    plan.grpc_config
+        .as_ref()
+        .map(|cfg| cfg.retry_buffer_limit_bytes)
+        .unwrap_or(MAX_BUFFER_SIZE)
+}
+
+fn is_single_grpc_request_frame(body: &[u8]) -> bool {
+    if body.len() < 5 || body[0] != 0 {
+        return false;
+    }
+
+    let Some(length_bytes) = body.get(1..5) else {
+        return false;
+    };
+    let Ok(length_bytes) = <[u8; 4]>::try_from(length_bytes) else {
+        return false;
+    };
+    let len = u32::from_be_bytes(length_bytes) as usize;
+    body.len() == len.saturating_add(5)
+}
+
+fn build_forward_uri(upstream_base: &Uri, final_path: &str) -> Option<Uri> {
+    let base_str = upstream_base.to_string();
+    let base_trimmed = base_str.trim_end_matches('/');
+    let uri_string = format!("{}{}", base_trimmed, final_path);
+    uri_string.parse::<Uri>().ok()
 }
 
 fn select_available_upstream(plan: &ForwardPlan) -> Option<&str> {
@@ -116,19 +367,130 @@ async fn send_upstream_request(
     req: Request<BoxBody<Bytes, ProxyError>>,
     plan: &ForwardPlan,
     method: &str,
-) -> Result<Response<Incoming>, ProxyError> {
+) -> Result<Response<Incoming>, UpstreamRequestError> {
     let request_fut = client.request(req);
-    if let Some(timeout) = plan.resilience.timeout_duration() {
+    let timeout = if matches!(plan.protocol, ProtocolKind::Grpc) {
+        grpc::effective_grpc_timeout(
+            plan.resilience.timeout_duration(),
+            plan.grpc_timeout,
+            plan.grpc_config
+                .as_ref()
+                .map(|cfg| cfg.respect_grpc_timeout)
+                .unwrap_or(true),
+        )
+    } else {
+        plan.resilience.timeout_duration()
+    };
+
+    if let Some(timeout) = timeout {
         match tokio::time::timeout(timeout, request_fut).await {
-            Ok(result) => result.map_err(|e| Box::new(e) as ProxyError),
+            Ok(result) => result.map_err(|e| UpstreamRequestError::Transport(Box::new(e))),
             Err(_) => {
                 record_upstream_timeout(method, &plan.target_upstream_name);
-                Err(anyhow::anyhow!("upstream request timed out after {:?}", timeout).into())
+                Err(UpstreamRequestError::Timeout(timeout))
             }
         }
     } else {
-        request_fut.await.map_err(|e| Box::new(e) as ProxyError)
+        request_fut
+            .await
+            .map_err(|e| UpstreamRequestError::Transport(Box::new(e)))
     }
+}
+
+fn should_emit_grpc_metrics(plan: &ForwardPlan) -> bool {
+    plan.grpc_config
+        .as_ref()
+        .map(|cfg| cfg.emit_grpc_metrics)
+        .unwrap_or(true)
+}
+
+fn grpc_service_name(plan: &ForwardPlan) -> &str {
+    plan.grpc_service.as_deref().unwrap_or("unknown")
+}
+
+fn grpc_method_name(plan: &ForwardPlan) -> &str {
+    plan.grpc_method.as_deref().unwrap_or("unknown")
+}
+
+fn record_grpc_plan_outcome(plan: &ForwardPlan, reason: &str, code: GrpcCode, start: Instant) {
+    if !should_emit_grpc_metrics(plan) {
+        return;
+    }
+
+    record_grpc_gateway_reject(reason, code.as_str(), &plan.target_upstream_name);
+    record_grpc_request(
+        grpc_service_name(plan),
+        grpc_method_name(plan),
+        code.as_str(),
+        &plan.target_upstream_name,
+        start,
+    );
+}
+
+fn record_grpc_reject_from_path(path: &str, reject: &PipelineReject, start: Instant) {
+    let code = grpc::grpc_code_for_reject(reject.reason);
+    let service_method = grpc::parse_grpc_path(path);
+    let service = service_method
+        .as_ref()
+        .map(|parts| parts.service.as_str())
+        .unwrap_or("unknown");
+    let method = service_method
+        .as_ref()
+        .map(|parts| parts.method.as_str())
+        .unwrap_or("unknown");
+
+    record_grpc_gateway_reject(
+        reject.reason.as_str(),
+        code.as_str(),
+        &reject.metrics_upstream,
+    );
+    record_grpc_request(
+        service,
+        method,
+        code.as_str(),
+        &reject.metrics_upstream,
+        start,
+    );
+}
+
+fn observe_grpc_response(
+    res: Response<Incoming>,
+    plan: &ForwardPlan,
+    upstream_url: &str,
+    start: Instant,
+) -> Response<BoxBody<Bytes, ProxyError>> {
+    let (parts, body) = res.into_parts();
+    let timeout = grpc::effective_grpc_timeout(
+        plan.resilience.timeout_duration(),
+        plan.grpc_timeout,
+        plan.grpc_config
+            .as_ref()
+            .map(|cfg| cfg.respect_grpc_timeout)
+            .unwrap_or(true),
+    )
+    .map(|timeout| {
+        timeout
+            .checked_sub(start.elapsed())
+            .unwrap_or(Duration::ZERO)
+    })
+    .map(tokio::time::sleep)
+    .map(Box::pin);
+
+    let body = GrpcObservedBody {
+        inner: body.map_err(|e| Box::new(e) as ProxyError),
+        service: grpc_service_name(plan).to_string(),
+        method: grpc_method_name(plan).to_string(),
+        upstream_pool: plan.target_upstream_name.clone(),
+        upstream_url: upstream_url.to_string(),
+        start,
+        emit_metrics: should_emit_grpc_metrics(plan),
+        timeout,
+        finalized: false,
+        observed_outcome: false,
+    }
+    .boxed();
+
+    Response::from_parts(parts, body)
 }
 
 /// Main proxy handler for HTTP/1.1 and HTTP/2
@@ -168,13 +530,14 @@ pub async fn proxy_handler(
             if matches!(reject.reason, pipeline::RejectReason::RouteNotFound) {
                 info!("No route matched for path: {}", req.uri().path());
             }
-            record_metrics(
-                &method,
-                reject.status.as_str(),
-                &reject.metrics_upstream,
-                start,
-            );
-            return Ok(pipeline_reject_to_http_response(reject));
+            let is_grpc_reject = matches!(reject.response_kind, RejectResponseKind::Grpc);
+            let metrics_upstream = reject.metrics_upstream.clone();
+            let resp = pipeline_reject_to_http_response(reject.clone());
+            record_metrics(&method, resp.status().as_str(), &metrics_upstream, start);
+            if is_grpc_reject {
+                record_grpc_reject_from_path(req.uri().path(), &reject, start);
+            }
+            return Ok(resp);
         }
         PipelineDecision::Forward(plan) => plan,
     };
@@ -210,8 +573,11 @@ pub async fn proxy_handler(
     let is_grpc = matches!(plan.protocol, ProtocolKind::Grpc);
     if is_grpc {
         info!(
-            "gRPC route accepted: path={} final_path={} upstream_pool={}",
-            plan.original_path, plan.final_path, plan.target_upstream_name
+            "gRPC route accepted: path={} final_path={} upstream_pool={} safe_unary_retry={}",
+            plan.original_path,
+            plan.final_path,
+            plan.target_upstream_name,
+            plan.grpc_retry_eligible
         );
     }
 
@@ -261,6 +627,18 @@ pub async fn proxy_handler(
         parts.headers.insert("X-User-Id", val);
     }
 
+    if is_grpc && plan.grpc_transport_validated && plan.grpc_retry_eligible {
+        let ctx = GrpcUnaryRequestContext {
+            parts,
+            client: grpc_client,
+            plan: &plan,
+            remote_addr,
+            method_str: &method,
+            start,
+        };
+        return handle_grpc_safe_unary_request(ctx, body, content_length).await;
+    }
+
     if is_grpc {
         handle_streaming_request(parts, body, grpc_client, &plan, remote_addr, &method, start).await
     } else if should_buffer {
@@ -268,6 +646,348 @@ pub async fn proxy_handler(
     } else {
         handle_streaming_request(parts, body, client, &plan, remote_addr, &method, start).await
     }
+}
+
+async fn handle_grpc_safe_unary_request(
+    ctx: GrpcUnaryRequestContext<'_>,
+    body: Incoming,
+    content_length: Option<u64>,
+) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError> {
+    let retry_limit = grpc_retry_buffer_limit(ctx.plan);
+
+    if let Some(len) = content_length
+        && len > retry_limit
+    {
+        info!(
+            "Skipping gRPC safe unary retry for {} because content-length {} exceeds limit {}",
+            ctx.plan.final_path, len, retry_limit
+        );
+        return handle_streaming_request(
+            ctx.parts,
+            body,
+            ctx.client,
+            ctx.plan,
+            ctx.remote_addr,
+            ctx.method_str,
+            ctx.start,
+        )
+        .await;
+    }
+
+    let body_bytes = body.collect().await?.to_bytes();
+    let body_len = body_bytes.len() as u64;
+    let has_single_frame = is_single_grpc_request_frame(body_bytes.as_ref());
+    let retry_allowed = body_len <= retry_limit && has_single_frame;
+
+    if !retry_allowed {
+        if body_len > retry_limit {
+            info!(
+                "Skipping gRPC safe unary retry for {} because buffered body {} exceeds limit {}",
+                ctx.plan.final_path, body_len, retry_limit
+            );
+        } else {
+            info!(
+                "Skipping gRPC safe unary retry for {} because request body is not a single gRPC frame",
+                ctx.plan.final_path
+            );
+        }
+    } else {
+        info!(
+            "gRPC safe unary retry enabled for {} with buffer {} bytes",
+            ctx.plan.final_path, body_len
+        );
+    }
+
+    let max_attempts = if retry_allowed {
+        max_request_attempts(ctx.plan)
+    } else {
+        1
+    };
+
+    send_buffered_grpc_request(ctx, body_bytes, max_attempts, retry_allowed).await
+}
+
+async fn send_buffered_grpc_request(
+    ctx: GrpcUnaryRequestContext<'_>,
+    body_bytes: Bytes,
+    max_attempts: usize,
+    retry_allowed: bool,
+) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError> {
+    let mut last_error: Option<String> = None;
+
+    for attempt in 0..max_attempts {
+        let Some(upstream_url_str) = select_available_upstream(ctx.plan) else {
+            warn!(
+                "No available gRPC unary upstream node for {}",
+                ctx.plan.target_upstream_name
+            );
+            record_grpc_plan_outcome(
+                ctx.plan,
+                "no_available_upstream",
+                GrpcCode::Unavailable,
+                ctx.start,
+            );
+            break;
+        };
+
+        let upstream_base = match upstream_url_str.parse::<Uri>() {
+            Ok(uri) => uri,
+            Err(err) => {
+                warn!(
+                    "Invalid gRPC unary upstream '{}' for {}: {}",
+                    upstream_url_str, ctx.plan.target_upstream_name, err
+                );
+                last_error = Some(format!("invalid upstream uri: {}", err));
+                continue;
+            }
+        };
+
+        let Some(new_uri) = build_forward_uri(&upstream_base, &ctx.plan.final_path) else {
+            record_grpc_plan_outcome(
+                ctx.plan,
+                "invalid_forward_uri",
+                GrpcCode::Unavailable,
+                ctx.start,
+            );
+            let resp = fallback_response(ctx.plan);
+            let status = resp.status().as_u16().to_string();
+            record_metrics(
+                ctx.method_str,
+                &status,
+                &ctx.plan.target_upstream_name,
+                ctx.start,
+            );
+            return Ok(resp);
+        };
+
+        let mut builder = Request::builder()
+            .method(ctx.parts.method.clone())
+            .uri(new_uri)
+            .version(Version::HTTP_2);
+        for (k, v) in &ctx.parts.headers {
+            builder = builder.header(k, v);
+        }
+        if let Some(host) = upstream_base.host() {
+            builder = builder.header("Host", host);
+        }
+        builder = builder.header("x-forwarded-for", ctx.remote_addr.ip().to_string());
+
+        let trace_ctx = tracing::Span::current().context();
+        if let Some(headers) = builder.headers_mut() {
+            opentelemetry::global::get_text_map_propagator(|propagator| {
+                propagator.inject_context(&trace_ctx, &mut HeaderInjector(headers))
+            });
+        }
+
+        let upstream_req = match builder.body(
+            Full::new(body_bytes.clone())
+                .map_err(|e| match e {})
+                .boxed(),
+        ) {
+            Ok(req) => req,
+            Err(err) => {
+                record_grpc_plan_outcome(
+                    ctx.plan,
+                    "request_build_failed",
+                    GrpcCode::Internal,
+                    ctx.start,
+                );
+                let resp = grpc::grpc_trailers_only_response(
+                    GrpcCode::Internal,
+                    format!("Failed to build request: {}", err),
+                );
+                let status = resp.status().as_u16().to_string();
+                record_metrics(
+                    ctx.method_str,
+                    &status,
+                    &ctx.plan.target_upstream_name,
+                    ctx.start,
+                );
+                return Ok(resp);
+            }
+        };
+
+        info!(
+            "gRPC safe unary attempt {}/{} -> upstream={} final_path={} retry_allowed={}",
+            attempt + 1,
+            max_attempts,
+            upstream_url_str,
+            ctx.plan.final_path,
+            retry_allowed
+        );
+
+        match send_upstream_request(&ctx.client, upstream_req, ctx.plan, ctx.method_str).await {
+            Ok(res) => {
+                let status_code = res.status();
+                if should_retry_grpc_safe_unary_status(status_code) {
+                    warn!(
+                        "gRPC safe unary upstream {} returned retryable HTTP status {}",
+                        upstream_url_str, status_code
+                    );
+                    if ctx
+                        .plan
+                        .upstream_state
+                        .record_node_failure(upstream_url_str, &ctx.plan.resilience)
+                    {
+                        record_upstream_circuit_open(
+                            ctx.method_str,
+                            &ctx.plan.target_upstream_name,
+                            upstream_url_str,
+                        );
+                    }
+
+                    if retry_allowed && attempt + 1 < max_attempts {
+                        info!(
+                            "Retrying gRPC unary request {} after HTTP status {} from {}",
+                            ctx.plan.final_path, status_code, upstream_url_str
+                        );
+                        record_upstream_retry(ctx.method_str, &ctx.plan.target_upstream_name);
+                        last_error = Some(format!("retryable grpc unary status {}", status_code));
+                        continue;
+                    }
+
+                    record_grpc_plan_outcome(
+                        ctx.plan,
+                        "retryable_http_status_exhausted",
+                        GrpcCode::Unavailable,
+                        ctx.start,
+                    );
+                    let resp = fallback_response(ctx.plan);
+                    let status = resp.status().as_u16().to_string();
+                    record_metrics(
+                        ctx.method_str,
+                        &status,
+                        &ctx.plan.target_upstream_name,
+                        ctx.start,
+                    );
+                    return Ok(resp);
+                }
+
+                ctx.plan
+                    .upstream_state
+                    .record_node_success(upstream_url_str);
+                let status = status_code.as_u16().to_string();
+                record_metrics(
+                    ctx.method_str,
+                    &status,
+                    &ctx.plan.target_upstream_name,
+                    ctx.start,
+                );
+                return Ok(observe_grpc_response(
+                    res,
+                    ctx.plan,
+                    upstream_url_str,
+                    ctx.start,
+                ));
+            }
+            Err(UpstreamRequestError::Timeout(timeout)) => {
+                warn!(
+                    "gRPC safe unary upstream {} timed out after {:?}",
+                    upstream_url_str, timeout
+                );
+                if ctx
+                    .plan
+                    .upstream_state
+                    .record_node_failure(upstream_url_str, &ctx.plan.resilience)
+                {
+                    record_upstream_circuit_open(
+                        ctx.method_str,
+                        &ctx.plan.target_upstream_name,
+                        upstream_url_str,
+                    );
+                }
+
+                if retry_allowed && attempt + 1 < max_attempts {
+                    info!(
+                        "Retrying gRPC unary request {} after timeout from {}",
+                        ctx.plan.final_path, upstream_url_str
+                    );
+                    record_upstream_retry(ctx.method_str, &ctx.plan.target_upstream_name);
+                    last_error = Some(format!("upstream request timed out after {:?}", timeout));
+                    continue;
+                }
+
+                record_grpc_plan_outcome(
+                    ctx.plan,
+                    "deadline_exceeded",
+                    GrpcCode::DeadlineExceeded,
+                    ctx.start,
+                );
+                let resp = deadline_exceeded_response(ctx.plan, timeout);
+                let status = resp.status().as_u16().to_string();
+                record_metrics(
+                    ctx.method_str,
+                    &status,
+                    &ctx.plan.target_upstream_name,
+                    ctx.start,
+                );
+                return Ok(resp);
+            }
+            Err(UpstreamRequestError::Transport(err)) => {
+                warn!(
+                    "gRPC safe unary upstream {} transport error: {:?}",
+                    upstream_url_str, err
+                );
+                if ctx
+                    .plan
+                    .upstream_state
+                    .record_node_failure(upstream_url_str, &ctx.plan.resilience)
+                {
+                    record_upstream_circuit_open(
+                        ctx.method_str,
+                        &ctx.plan.target_upstream_name,
+                        upstream_url_str,
+                    );
+                }
+
+                if retry_allowed && attempt + 1 < max_attempts {
+                    info!(
+                        "Retrying gRPC unary request {} after transport error from {}",
+                        ctx.plan.final_path, upstream_url_str
+                    );
+                    record_upstream_retry(ctx.method_str, &ctx.plan.target_upstream_name);
+                    last_error = Some(format!("{:?}", err));
+                    continue;
+                }
+
+                record_grpc_plan_outcome(
+                    ctx.plan,
+                    "upstream_transport_error",
+                    GrpcCode::Unavailable,
+                    ctx.start,
+                );
+                let resp = fallback_response(ctx.plan);
+                let status = resp.status().as_u16().to_string();
+                record_metrics(
+                    ctx.method_str,
+                    &status,
+                    &ctx.plan.target_upstream_name,
+                    ctx.start,
+                );
+                return Ok(resp);
+            }
+        }
+    }
+
+    error!(
+        "All gRPC unary upstream attempts failed for {}. Last: {:?}",
+        ctx.plan.final_path, last_error
+    );
+    record_grpc_plan_outcome(
+        ctx.plan,
+        "all_unary_attempts_failed",
+        GrpcCode::Unavailable,
+        ctx.start,
+    );
+    let resp = fallback_response(ctx.plan);
+    let status = resp.status().as_u16().to_string();
+    record_metrics(
+        ctx.method_str,
+        &status,
+        &ctx.plan.target_upstream_name,
+        ctx.start,
+    );
+    Ok(resp)
 }
 
 async fn handle_buffered_request(
@@ -284,7 +1004,7 @@ async fn handle_buffered_request(
     let body_full = Full::new(body_bytes);
 
     let max_failover_attempts = max_request_attempts(plan);
-    let mut last_error: Option<ProxyError> = None;
+    let mut last_error: Option<String> = None;
 
     for attempt in 0..max_failover_attempts {
         let Some(upstream_url_str) = select_available_upstream(plan) else {
@@ -366,10 +1086,7 @@ async fn handle_buffered_request(
                         continue;
                     }
 
-                    last_error = Some(crate::error::error(format!(
-                        "upstream returned retryable status {}",
-                        status
-                    )));
+                    last_error = Some(format!("upstream returned retryable status {}", status));
                     break;
                 } else {
                     plan.upstream_state.record_node_success(upstream_url_str);
@@ -455,7 +1172,12 @@ async fn handle_buffered_request(
                 if attempt + 1 < max_failover_attempts {
                     record_upstream_retry(method_str, &plan.target_upstream_name);
                 }
-                last_error = Some(err);
+                last_error = Some(match err {
+                    UpstreamRequestError::Timeout(timeout) => {
+                        format!("upstream request timed out after {:?}", timeout)
+                    }
+                    UpstreamRequestError::Transport(err) => format!("{:?}", err),
+                });
             }
         }
     }
@@ -481,6 +1203,9 @@ async fn handle_streaming_request(
             "No available streaming upstream node for {}",
             plan.target_upstream_name
         );
+        if matches!(plan.protocol, ProtocolKind::Grpc) {
+            record_grpc_plan_outcome(plan, "no_available_upstream", GrpcCode::Unavailable, start);
+        }
         let resp = fallback_response(plan);
         let status = resp.status().as_u16().to_string();
         record_metrics(method_str, &status, &plan.target_upstream_name, start);
@@ -490,6 +1215,14 @@ async fn handle_streaming_request(
     let upstream_base = match upstream_url_str.parse::<Uri>() {
         Ok(u) => u,
         Err(_) => {
+            if matches!(plan.protocol, ProtocolKind::Grpc) {
+                record_grpc_plan_outcome(
+                    plan,
+                    "invalid_upstream_uri",
+                    GrpcCode::Unavailable,
+                    start,
+                );
+            }
             let resp = fallback_response(plan);
             let status = resp.status().as_u16().to_string();
             record_metrics(method_str, &status, &plan.target_upstream_name, start);
@@ -512,6 +1245,9 @@ async fn handle_streaming_request(
     let new_uri = match uri_string.parse::<Uri>() {
         Ok(u) => u,
         Err(_) => {
+            if matches!(plan.protocol, ProtocolKind::Grpc) {
+                record_grpc_plan_outcome(plan, "invalid_forward_uri", GrpcCode::Unavailable, start);
+            }
             let resp = fallback_response(plan);
             let status = resp.status().as_u16().to_string();
             record_metrics(method_str, &status, &plan.target_upstream_name, start);
@@ -547,6 +1283,20 @@ async fn handle_streaming_request(
     let streaming_req = match builder.body(body.map_err(|e| Box::new(e) as ProxyError).boxed()) {
         Ok(r) => r,
         Err(_) => {
+            if matches!(plan.protocol, ProtocolKind::Grpc) {
+                record_grpc_plan_outcome(plan, "request_build_failed", GrpcCode::Internal, start);
+                let resp = grpc::grpc_trailers_only_response(
+                    GrpcCode::Internal,
+                    "Failed to build request",
+                );
+                record_metrics(
+                    method_str,
+                    resp.status().as_str(),
+                    &plan.target_upstream_name,
+                    start,
+                );
+                return Ok(resp);
+            }
             return Ok(Response::builder()
                 .status(500)
                 .body(Empty::new().map_err(|e| match e {}).boxed())
@@ -580,9 +1330,38 @@ async fn handle_streaming_request(
 
             let status = status_code.as_u16().to_string();
             record_metrics(method_str, &status, &plan.target_upstream_name, start);
-            Ok(res.map(|b| b.map_err(|e| Box::new(e) as ProxyError).boxed()))
+            if matches!(plan.protocol, ProtocolKind::Grpc) {
+                Ok(observe_grpc_response(res, plan, upstream_url_str, start))
+            } else {
+                Ok(res.map(|b| b.map_err(|e| Box::new(e) as ProxyError).boxed()))
+            }
         }
-        Err(err) => {
+        Err(UpstreamRequestError::Timeout(timeout)) => {
+            error!("Streaming failed due to deadline: {:?}", timeout);
+            if plan
+                .upstream_state
+                .record_node_failure(upstream_url_str, &plan.resilience)
+            {
+                record_upstream_circuit_open(
+                    method_str,
+                    &plan.target_upstream_name,
+                    upstream_url_str,
+                );
+            }
+            if matches!(plan.protocol, ProtocolKind::Grpc) {
+                record_grpc_plan_outcome(
+                    plan,
+                    "deadline_exceeded",
+                    GrpcCode::DeadlineExceeded,
+                    start,
+                );
+            }
+            let resp = deadline_exceeded_response(plan, timeout);
+            let status = resp.status().as_u16().to_string();
+            record_metrics(method_str, &status, &plan.target_upstream_name, start);
+            Ok(resp)
+        }
+        Err(UpstreamRequestError::Transport(err)) => {
             error!("Streaming failed: {:?}", err);
             if plan
                 .upstream_state
@@ -592,6 +1371,14 @@ async fn handle_streaming_request(
                     method_str,
                     &plan.target_upstream_name,
                     upstream_url_str,
+                );
+            }
+            if matches!(plan.protocol, ProtocolKind::Grpc) {
+                record_grpc_plan_outcome(
+                    plan,
+                    "upstream_transport_error",
+                    GrpcCode::Unavailable,
+                    start,
                 );
             }
             let resp = fallback_response(plan);
@@ -724,13 +1511,14 @@ async fn proxy_http3_request(
             if matches!(reject.reason, pipeline::RejectReason::RouteNotFound) {
                 info!("HTTP/3 No route matched for path: {}", req.uri.path());
             }
+            let resp = pipeline_reject_to_http3_response(&reject);
             record_metrics(
                 &method_str,
-                reject.status.as_str(),
+                resp.status().as_str(),
                 &reject.metrics_upstream,
                 start,
             );
-            return Ok(pipeline_reject_to_http3_response(&reject));
+            return Ok(resp);
         }
         PipelineDecision::Forward(plan) => plan,
     };
@@ -938,7 +1726,12 @@ async fn proxy_http3_request(
                 if attempt + 1 < max_failover_attempts {
                     record_upstream_retry(&method_str, &plan.target_upstream_name);
                 }
-                last_error = Some(format!("{:?}", e));
+                last_error = Some(match e {
+                    UpstreamRequestError::Timeout(timeout) => {
+                        format!("upstream request timed out after {:?}", timeout)
+                    }
+                    UpstreamRequestError::Transport(err) => format!("{:?}", err),
+                });
             }
         }
     }

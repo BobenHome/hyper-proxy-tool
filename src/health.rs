@@ -1,29 +1,50 @@
 use arc_swap::ArcSwap;
-use http_body_util::{BodyExt, Empty};
-use hyper::Uri;
+use bytes::Bytes;
+use http_body_util::{BodyExt, Empty, Full};
+use hyper::{Method, Request, StatusCode, Uri, Version};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::config::AppConfig;
-use crate::error::ProxyError;
+use crate::config::{AppConfig, HealthCheckMode, UpstreamHealthConfig};
+use crate::error::{ProxyError, error};
+use crate::grpc::{self, GrpcCode, HealthServingStatus};
 use crate::state::{AppState, HttpClient};
+
+fn empty_body() -> http_body_util::combinators::BoxBody<Bytes, ProxyError> {
+    Empty::<Bytes>::new()
+        .map_err(|never| match never {})
+        .boxed()
+}
+
+fn full_body(bytes: Bytes) -> http_body_util::combinators::BoxBody<Bytes, ProxyError> {
+    Full::new(bytes).map_err(|never| match never {}).boxed()
+}
+
+fn health_interval(config: &UpstreamHealthConfig) -> Duration {
+    Duration::from_millis(config.interval_ms.max(100))
+}
+
+fn health_timeout(config: &UpstreamHealthConfig) -> Duration {
+    Duration::from_millis(config.timeout_ms.max(1))
+}
 
 /// Start health check loop
 pub async fn start_health_check_loop(
     config: Arc<ArcSwap<AppConfig>>,
     state: Arc<AppState>,
     client: Arc<HttpClient>,
+    grpc_client: Arc<HttpClient>,
     token: CancellationToken,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    let mut scheduler = tokio::time::interval(Duration::from_millis(200));
+    let mut last_checked: HashMap<String, Instant> = HashMap::new();
 
     loop {
         tokio::select! {
-            _ = interval.tick() => {
-                // Continue execution
-            }
+            _ = scheduler.tick() => {}
             _ = token.cancelled() => {
                 info!("Health check loop stopped.");
                 return;
@@ -32,68 +53,183 @@ pub async fn start_health_check_loop(
 
         let current_config = config.load();
         let current_state_map = state.upstreams.load();
+        last_checked.retain(|name, _| current_config.upstreams.contains_key(name));
 
         for (name, upstream_config) in &current_config.upstreams {
-            if let Some(upstream_state) = current_state_map.get(name) {
-                // Skip health check if disabled for this upstream
-                if !upstream_config.health_check {
-                    let all_urls: Vec<String> = upstream_config.urls.clone();
-                    let current = upstream_state.active_urls.load();
-                    if current.len() != all_urls.len() {
-                        info!(
-                            "Upstream '{}' health check disabled, marking all nodes healthy",
-                            name
-                        );
-                        upstream_state.active_urls.store(Arc::new(all_urls));
-                    }
-                    continue;
-                }
+            let Some(upstream_state) = current_state_map.get(name) else {
+                continue;
+            };
 
-                let mut healthy_urls = Vec::new();
-                for url in &upstream_config.urls {
-                    if check_upstream(&client, url).await {
-                        healthy_urls.push(url.clone());
-                    } else {
-                        warn!("Health check failed for: {}", url);
-                    }
-                }
+            let health_config = upstream_config.effective_health_config();
+            let should_check = match last_checked.get(name) {
+                Some(last) => last.elapsed() >= health_interval(&health_config),
+                None => true,
+            };
+            if !should_check {
+                continue;
+            }
+            last_checked.insert(name.clone(), Instant::now());
 
-                if healthy_urls.is_empty() {
-                    warn!("All nodes down for upstream: {}", name);
-                    upstream_state.active_urls.store(Arc::new(vec![]));
-                } else {
-                    let current_len = upstream_state.active_urls.load().len();
-                    if current_len != healthy_urls.len() {
-                        info!(
-                            "Upstream '{}' healthy nodes changed: {} -> {:?}",
-                            name, current_len, healthy_urls
-                        );
+            match health_config.mode {
+                HealthCheckMode::Off => {
+                    mark_all_nodes_healthy(name, upstream_config, upstream_state);
+                }
+                HealthCheckMode::Http | HealthCheckMode::Grpc => {
+                    let mut healthy_urls = Vec::new();
+                    for url in &upstream_config.urls {
+                        if check_upstream_with_mode(&client, &grpc_client, url, &health_config)
+                            .await
+                        {
+                            healthy_urls.push(url.clone());
+                        } else {
+                            warn!(
+                                "Health check failed for upstream '{}' node '{}' via {:?}",
+                                name, url, health_config.mode
+                            );
+                        }
                     }
-                    upstream_state.active_urls.store(Arc::new(healthy_urls));
+
+                    update_healthy_urls(name, upstream_state, healthy_urls);
                 }
             }
         }
     }
 }
 
-/// Check if upstream is healthy
-pub async fn check_upstream(client: &HttpClient, url: &str) -> bool {
+fn mark_all_nodes_healthy(
+    name: &str,
+    upstream_config: &crate::config::UpstreamConfig,
+    upstream_state: &crate::state::UpstreamState,
+) {
+    let all_urls = upstream_config.urls.clone();
+    let current = upstream_state.active_urls.load();
+    if current.as_ref() != &all_urls {
+        info!(
+            "Upstream '{}' health check disabled, marking all nodes healthy",
+            name
+        );
+        upstream_state.active_urls.store(Arc::new(all_urls));
+    }
+}
+
+fn update_healthy_urls(
+    name: &str,
+    upstream_state: &crate::state::UpstreamState,
+    healthy_urls: Vec<String>,
+) {
+    let current = upstream_state.active_urls.load();
+    if healthy_urls.is_empty() {
+        warn!("All nodes down for upstream: {}", name);
+        if !current.is_empty() {
+            upstream_state.active_urls.store(Arc::new(Vec::new()));
+        }
+        return;
+    }
+
+    if current.as_ref() != &healthy_urls {
+        info!(
+            "Upstream '{}' healthy nodes changed: {:?} -> {:?}",
+            name,
+            current.as_ref(),
+            healthy_urls
+        );
+        upstream_state.active_urls.store(Arc::new(healthy_urls));
+    }
+}
+
+async fn check_upstream_with_mode(
+    client: &HttpClient,
+    grpc_client: &HttpClient,
+    url: &str,
+    health_config: &UpstreamHealthConfig,
+) -> bool {
+    match health_config.mode {
+        HealthCheckMode::Http => {
+            check_upstream_http(client, url, health_timeout(health_config)).await
+        }
+        HealthCheckMode::Grpc => check_upstream_grpc(grpc_client, url, health_config).await,
+        HealthCheckMode::Off => true,
+    }
+}
+
+/// Check if upstream is healthy via HTTP HEAD.
+pub async fn check_upstream_http(client: &HttpClient, url: &str, timeout: Duration) -> bool {
     let uri = match url.parse::<Uri>() {
-        Ok(u) => u,
+        Ok(uri) => uri,
         Err(_) => return false,
     };
 
-    let body: http_body_util::combinators::BoxBody<bytes::Bytes, ProxyError> =
-        Empty::<bytes::Bytes>::new().map_err(|e| match e {}).boxed();
-
-    let req = hyper::Request::builder()
-        .method("HEAD")
+    let req = Request::builder()
+        .method(Method::HEAD)
         .uri(uri)
-        .body(body)
+        .body(empty_body())
         .unwrap();
 
-    match tokio::time::timeout(Duration::from_secs(2), client.request(req)).await {
+    match tokio::time::timeout(timeout, client.request(req)).await {
         Ok(Ok(res)) => res.status().as_u16() < 500,
         _ => false,
     }
+}
+
+/// Check if upstream is healthy via grpc.health.v1.Health/Check.
+pub async fn check_upstream_grpc(
+    grpc_client: &HttpClient,
+    url: &str,
+    health_config: &UpstreamHealthConfig,
+) -> bool {
+    match tokio::time::timeout(
+        health_timeout(health_config),
+        check_upstream_grpc_inner(grpc_client, url, health_config),
+    )
+    .await
+    {
+        Ok(Ok(healthy)) => healthy,
+        Ok(Err(err)) => {
+            warn!("gRPC health check request failed for '{}': {}", url, err);
+            false
+        }
+        Err(_) => false,
+    }
+}
+
+async fn check_upstream_grpc_inner(
+    grpc_client: &HttpClient,
+    url: &str,
+    health_config: &UpstreamHealthConfig,
+) -> Result<bool, ProxyError> {
+    let uri: Uri = format!("{}/grpc.health.v1.Health/Check", url.trim_end_matches('/'))
+        .parse()
+        .map_err(|e| error(format!("Invalid gRPC health URI '{}': {}", url, e)))?;
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .version(Version::HTTP_2)
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(full_body(grpc::encode_health_check_request(
+            health_config.service.as_deref(),
+        )))
+        .unwrap();
+
+    let res = grpc_client.request(req).await?;
+    if res.status() != StatusCode::OK {
+        return Ok(false);
+    }
+
+    let collected = res.into_body().collect().await?;
+    let trailers = collected
+        .trailers()
+        .cloned()
+        .ok_or_else(|| error("missing grpc health trailers"))?;
+
+    if grpc::parse_grpc_status(&trailers).unwrap_or(-1) != GrpcCode::Ok.as_i32() {
+        return Ok(false);
+    }
+
+    let body = collected.to_bytes();
+    let status = grpc::decode_health_check_response(&body)
+        .ok_or_else(|| error("invalid grpc health response body"))?;
+
+    Ok(status == HealthServingStatus::Serving)
 }

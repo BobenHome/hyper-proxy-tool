@@ -106,18 +106,36 @@ cargo run -- --config config.toml
 
 ### gRPC h2c 配置示例
 
-gRPC v1 支持显式 `grpc = true` 的 HTTP/2 路由，并使用 HTTP/2 prior knowledge 转发到 `http://` h2c 上游。当前普通健康检查使用 HTTP `HEAD`，通常不适合 gRPC 服务，因此建议为 gRPC upstream 设置 `health_check = false`。
+gRPC v2 支持显式 `grpc = true` 的 HTTP/2 路由，并使用 HTTP/2 prior knowledge 转发到 `http://` h2c 上游。对于 gRPC 服务，可以直接为 upstream 配置 `grpc.health.v1.Health/Check` 健康检查。
 
 ```toml
 [upstreams.grpc_backend]
 urls = ["http://127.0.0.1:50051", "http://127.0.0.1:50052"]
-health_check = false
+
+[upstreams.grpc_backend.health]
+mode = "grpc"
+interval_ms = 5000
+timeout_ms = 2000
 
 [[routes]]
 path = "/helloworld.Greeter"
 upstream = "grpc_backend"
 grpc = true
 strip_prefix = false
+```
+
+如果需要对单个 unary 方法开启受控重试，可以把路由写成精确 method path，并在 `grpc_config.retry_mode` 中显式开启 `safe_unary`。当前实现只会对“单个 gRPC frame 请求体”启用重试；多帧请求和业务级 `grpc-status != 0` 都不会自动重试。
+
+```toml
+[[routes]]
+path = "/retry.Greeter/SayHello"
+upstream = "grpc_backend"
+grpc = true
+strip_prefix = false
+
+[routes.grpc_config]
+retry_mode = "safe_unary"
+retry_buffer_limit_bytes = 65536
 ```
 
 ---

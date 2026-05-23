@@ -4,6 +4,15 @@ use std::time::Instant;
 /// Initialize metrics descriptions
 pub fn init_metrics() {
     describe_counter!("http_requests_total", "Total requests");
+    describe_counter!("grpc_requests_total", "Total gRPC requests");
+    describe_counter!(
+        "grpc_gateway_reject_total",
+        "Total locally rejected gRPC requests"
+    );
+    describe_counter!(
+        "grpc_upstream_status_total",
+        "Observed gRPC upstream status trailers"
+    );
     describe_counter!("upstream_retries_total", "Total upstream retry attempts");
     describe_counter!("upstream_timeouts_total", "Total upstream request timeouts");
     describe_counter!(
@@ -11,6 +20,7 @@ pub fn init_metrics() {
         "Total upstream circuit breaker openings"
     );
     describe_histogram!("http_request_duration_seconds", "Request latency");
+    describe_histogram!("grpc_request_duration_seconds", "gRPC request latency");
     describe_gauge!("active_connections", "Active connections");
 }
 
@@ -31,6 +41,56 @@ pub fn record_metrics(method: &str, status: &str, upstream: &str, start: Instant
         "upstream" => upstream.to_string()
     )
     .record(duration);
+}
+
+/// Record gRPC request metrics.
+pub fn record_grpc_request(
+    service: &str,
+    method: &str,
+    grpc_status: &str,
+    upstream: &str,
+    start: Instant,
+) {
+    let duration = start.elapsed().as_secs_f64();
+    counter!(
+        "grpc_requests_total",
+        "service" => service.to_string(),
+        "method" => method.to_string(),
+        "grpc_status" => grpc_status.to_string(),
+        "upstream" => upstream.to_string()
+    )
+    .increment(1);
+    histogram!(
+        "grpc_request_duration_seconds",
+        "service" => service.to_string(),
+        "method" => method.to_string(),
+        "grpc_status" => grpc_status.to_string(),
+        "upstream" => upstream.to_string()
+    )
+    .record(duration);
+}
+
+/// Record a locally generated gRPC reject/fallback response.
+pub fn record_grpc_gateway_reject(reason: &str, grpc_status: &str, upstream: &str) {
+    counter!(
+        "grpc_gateway_reject_total",
+        "reason" => reason.to_string(),
+        "grpc_status" => grpc_status.to_string(),
+        "upstream" => upstream.to_string()
+    )
+    .increment(1);
+}
+
+/// Record an observed upstream gRPC status trailer.
+pub fn record_grpc_upstream_status(service: &str, method: &str, grpc_status: &str, upstream: &str) {
+    counter!(
+        "grpc_upstream_status_total",
+        "service" => service.to_string(),
+        "method" => method.to_string(),
+        "grpc_status" => grpc_status.to_string(),
+        "upstream" => upstream.to_string()
+    )
+    .increment(1);
 }
 
 /// Record an upstream retry attempt.

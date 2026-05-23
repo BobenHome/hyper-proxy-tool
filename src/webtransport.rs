@@ -10,7 +10,8 @@ use tracing::{error, info, warn};
 use crate::config::AppConfig;
 use crate::error::ProxyError;
 use crate::pipeline::{
-    self, LocalReplyKind, PipelineDecision, PipelineReject, ProtocolKind, RequestContext,
+    self, LocalReplyKind, PipelineDecision, PipelineReject, ProtocolKind, RejectResponseKind,
+    RequestContext,
 };
 use crate::state::{AppState, HttpClient};
 
@@ -138,6 +139,7 @@ pub async fn handle_webtransport_session(
                 reason: pipeline::RejectReason::RouteNotFound,
                 message: "404 Not Found".to_string(),
                 metrics_upstream: plan.target_upstream_name.clone(),
+                response_kind: RejectResponseKind::Http,
             },
         )
         .await;

@@ -40,8 +40,26 @@ endpoint = "http://localhost:4317"
   urls = ["http://127.0.0.1:9443"]
 
   # 本地 gRPC h2c 上游，用于测试 HTTP/2 prior knowledge 代理。
-  # gRPC 服务通常不支持普通 HEAD 健康检查，因此 v1 示例关闭 health_check。
   [upstreams.grpc_backend]
+  urls = ["http://127.0.0.1:50051", "http://127.0.0.1:50052"]
+    [upstreams.grpc_backend.health]
+    mode = "grpc"
+    interval_ms = 500
+    timeout_ms = 1000
+
+  [upstreams.grpc_retry_connect_backend]
+  urls = ["http://127.0.0.1:50053", "http://127.0.0.1:50051"]
+  health_check = false
+
+  [upstreams.grpc_retry_status_backend]
+  urls = ["http://127.0.0.1:50051", "http://127.0.0.1:50052"]
+  health_check = false
+
+  [upstreams.grpc_retry_business_backend]
+  urls = ["http://127.0.0.1:50051", "http://127.0.0.1:50052"]
+  health_check = false
+
+  [upstreams.grpc_retry_stream_backend]
   urls = ["http://127.0.0.1:50051", "http://127.0.0.1:50052"]
   health_check = false
 
@@ -108,6 +126,45 @@ path = "/helloworld.Greeter"
 upstream = "grpc_backend"
 strip_prefix = false
 grpc = true
+
+[[routes]]
+path = "/secure.Greeter"
+upstream = "grpc_backend"
+strip_prefix = false
+grpc = true
+auth = true
+
+[[routes]]
+path = "/retry.Greeter/ConnectFail"
+upstream = "grpc_retry_connect_backend"
+strip_prefix = false
+grpc = true
+  [routes.grpc_config]
+  retry_mode = "safe_unary"
+
+[[routes]]
+path = "/retry.Greeter/RetryOn503"
+upstream = "grpc_retry_status_backend"
+strip_prefix = false
+grpc = true
+  [routes.grpc_config]
+  retry_mode = "safe_unary"
+
+[[routes]]
+path = "/retry.Greeter/BusinessFail"
+upstream = "grpc_retry_business_backend"
+strip_prefix = false
+grpc = true
+  [routes.grpc_config]
+  retry_mode = "safe_unary"
+
+[[routes]]
+path = "/retry.Greeter/MaybeStream503"
+upstream = "grpc_retry_stream_backend"
+strip_prefix = false
+grpc = true
+  [routes.grpc_config]
+  retry_mode = "safe_unary"
 
 # [[routes]]
 # path = "/ws"

@@ -33,6 +33,7 @@ mod cache;
 mod canary;
 mod config;
 mod error;
+mod grpc;
 mod health;
 mod metrics;
 mod pipeline;
@@ -198,6 +199,7 @@ async fn main() -> Result<(), error::ProxyError> {
     let manager_config = app_config.clone();
     let manager_state = app_state.clone();
     let manager_client = client.clone();
+    let manager_grpc_client = grpc_client.clone();
     let config_file_path = config_path.clone();
 
     tokio::spawn(async move {
@@ -206,6 +208,7 @@ async fn main() -> Result<(), error::ProxyError> {
             manager_config.clone(),
             manager_state.clone(),
             manager_client.clone(),
+            manager_grpc_client.clone(),
             cancel_token.clone(),
         ));
 
@@ -252,6 +255,7 @@ async fn main() -> Result<(), error::ProxyError> {
                                     manager_config.clone(),
                                     manager_state.clone(),
                                     manager_client.clone(),
+                                    manager_grpc_client.clone(),
                                     cancel_token.clone(),
                                 ));
                             }

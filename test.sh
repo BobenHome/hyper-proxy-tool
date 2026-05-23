@@ -60,6 +60,16 @@ is_local_server_url() {
     esac
 }
 
+grpc_health_file() {
+    echo "/tmp/hyper-proxy-tool-$1.health"
+}
+
+set_grpc_health_status() {
+    local name="$1"
+    local status="$2"
+    printf '%s\n' "$status" > "$(grpc_health_file "$name")"
+}
+
 # 启动本地 HTTP 上游，供 stable upstream (http://127.0.0.1:9443) 使用。
 # 只监听 TCP 9443，不影响 WebTransport 上游使用同一端口的 UDP/QUIC。
 start_local_upstream() {
@@ -186,10 +196,30 @@ start_grpc_upstreams() {
         local port="${spec%%:*}"
         local name="${spec##*:}"
         local log="/tmp/hyper-proxy-tool-${name}.log"
+        local health_file
+        health_file="$(grpc_health_file "$name")"
+
+        set_grpc_health_status "$name" "SERVING"
+
+        if command -v lsof &> /dev/null; then
+            local existing_pids
+            existing_pids="$(lsof -t -nP -iTCP:$port -sTCP:LISTEN 2>/dev/null || true)"
+            if [ -n "$existing_pids" ]; then
+                print_test "清理已占用端口 $port 的旧 gRPC 测试上游进程: $existing_pids"
+                for pid in $existing_pids; do
+                    {
+                        kill "$pid" || true
+                        sleep 0.2
+                        kill -9 "$pid" || true
+                        wait "$pid" || true
+                    } 2>/dev/null
+                done
+            fi
+        fi
 
         (
             cd "$SCRIPT_DIR"
-            GRPC_PORT="$port" GRPC_NAME="$name" node "$SCRIPT_DIR/grpc-server.js"
+            GRPC_PORT="$port" GRPC_NAME="$name" GRPC_HEALTH_FILE="$health_file" node "$SCRIPT_DIR/grpc-server.js"
         ) > "$log" 2>&1 &
         local pid=$!
 
@@ -197,11 +227,6 @@ start_grpc_upstreams() {
         if kill -0 "$pid" 2>/dev/null; then
             GRPC_UPSTREAM_PIDS="$GRPC_UPSTREAM_PIDS $pid"
             started=$((started + 1))
-            continue
-        fi
-
-        if grep -qi "EADDRINUSE" "$log"; then
-            print_pass "本地 gRPC h2c 测试上游 ${name} 已运行"
             continue
         fi
 
@@ -227,6 +252,7 @@ stop_grpc_upstreams() {
         fi
     done
     GRPC_UPSTREAM_PIDS=""
+    rm -f "$(grpc_health_file grpc-a)" "$(grpc_health_file grpc-b)"
 }
 
 start_wt_upstream() {
@@ -785,6 +811,94 @@ test_grpc_unary_load_balancing() {
     cat /tmp/hyper-proxy-tool-grpc-client.log 2>/dev/null || true
 }
 
+test_grpc_trailer_passthrough() {
+    print_test "测试 gRPC trailer 透传"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v node &> /dev/null; then
+        print_skip "需要 node 来运行 gRPC h2c 集成测试"
+        return
+    fi
+
+    if grpc_proxy_request "/helloworld.Greeter/Fail" >/tmp/hyper-proxy-tool-grpc-fail.stdout 2>/tmp/hyper-proxy-tool-grpc-fail.log; then
+        print_fail "gRPC trailer 非 0 状态应导致客户端失败"
+        cat /tmp/hyper-proxy-tool-grpc-fail.stdout 2>/dev/null || true
+        return
+    fi
+
+    if grep -q "grpc-status 14" /tmp/hyper-proxy-tool-grpc-fail.log; then
+        print_pass "gRPC 非 0 trailer 状态成功透传给客户端"
+    else
+        print_fail "未观察到透传的 grpc-status 14"
+        cat /tmp/hyper-proxy-tool-grpc-fail.log 2>/dev/null || true
+    fi
+}
+
+test_grpc_gateway_reject_mapping() {
+    print_test "测试网关本地 gRPC 拒绝映射"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v node &> /dev/null; then
+        print_skip "需要 node 来运行 gRPC h2c 集成测试"
+        return
+    fi
+
+    if grpc_proxy_request "/secure.Greeter/SayHello" >/tmp/hyper-proxy-tool-grpc-secure.stdout 2>/tmp/hyper-proxy-tool-grpc-secure.log; then
+        print_fail "缺少鉴权的 gRPC 请求应被网关拒绝"
+        cat /tmp/hyper-proxy-tool-grpc-secure.stdout 2>/dev/null || true
+        return
+    fi
+
+    if grep -q "grpc-status 16" /tmp/hyper-proxy-tool-grpc-secure.log; then
+        print_pass "网关本地鉴权拒绝已映射为 gRPC UNAUTHENTICATED"
+    else
+        print_fail "未观察到 grpc-status 16"
+        cat /tmp/hyper-proxy-tool-grpc-secure.log 2>/dev/null || true
+    fi
+}
+
+test_grpc_deadline_respected() {
+    print_test "测试 gRPC grpc-timeout deadline 生效"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v node &> /dev/null; then
+        print_skip "需要 node 来运行 gRPC h2c 集成测试"
+        return
+    fi
+
+    local start_ts
+    local end_ts
+    local elapsed
+
+    start_ts=$(date +%s)
+    if GRPC_TIMEOUT_HEADER="1S" grpc_proxy_request "/helloworld.Greeter/Slow" >/tmp/hyper-proxy-tool-grpc-deadline.stdout 2>/tmp/hyper-proxy-tool-grpc-deadline.log; then
+        print_fail "设置 grpc-timeout 后的慢请求应返回 deadline exceeded"
+        cat /tmp/hyper-proxy-tool-grpc-deadline.stdout 2>/dev/null || true
+        return
+    fi
+    end_ts=$(date +%s)
+    elapsed=$((end_ts - start_ts))
+
+    if grep -q "grpc-status 4" /tmp/hyper-proxy-tool-grpc-deadline.log && [ "$elapsed" -lt 10 ]; then
+        print_pass "grpc-timeout 已在网关生效并返回 DEADLINE_EXCEEDED"
+    else
+        print_fail "grpc-timeout 未按预期触发 deadline exceeded，耗时 ${elapsed}s"
+        cat /tmp/hyper-proxy-tool-grpc-deadline.log 2>/dev/null || true
+    fi
+}
+
 test_grpc_streaming_timeout_bypass() {
     print_test "测试 gRPC 流式请求不受 10 秒 HTTP 超时影响"
 
@@ -813,6 +927,186 @@ test_grpc_streaming_timeout_bypass() {
     else
         print_fail "gRPC 长耗时请求应超过 10 秒并成功返回，耗时 ${elapsed}s，响应: $response"
         cat /tmp/hyper-proxy-tool-grpc-slow.log 2>/dev/null || true
+    fi
+}
+
+test_grpc_health_check_marks_node_down() {
+    print_test "测试 gRPC health check 摘除不健康节点"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v node &> /dev/null; then
+        print_skip "需要 node 来运行 gRPC h2c 集成测试"
+        return
+    fi
+
+    set_grpc_health_status "grpc-a" "NOT_SERVING"
+    sleep 2
+
+    local saw_a=0
+    local saw_b=0
+    local response=""
+
+    for _ in {1..6}; do
+        response=$(grpc_proxy_request "/helloworld.Greeter/SayHello" 2>/tmp/hyper-proxy-tool-grpc-health-down.log || true)
+        if echo "$response" | grep -q "grpc-a"; then
+            saw_a=1
+        fi
+        if echo "$response" | grep -q "grpc-b"; then
+            saw_b=1
+        fi
+        sleep 0.2
+    done
+
+    if [ "$saw_a" = "0" ] && [ "$saw_b" = "1" ]; then
+        print_pass "gRPC health check 已摘除 NOT_SERVING 节点"
+    else
+        print_fail "NOT_SERVING 节点仍可能被选中，最后响应: $response"
+        cat /tmp/hyper-proxy-tool-grpc-health-down.log 2>/dev/null || true
+    fi
+}
+
+test_grpc_health_check_recovers_node() {
+    print_test "测试 gRPC health check 恢复健康节点"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v node &> /dev/null; then
+        print_skip "需要 node 来运行 gRPC h2c 集成测试"
+        return
+    fi
+
+    set_grpc_health_status "grpc-a" "SERVING"
+    sleep 2
+
+    local saw_a=0
+    local saw_b=0
+    local response=""
+
+    for _ in {1..8}; do
+        response=$(grpc_proxy_request "/helloworld.Greeter/SayHello" 2>/tmp/hyper-proxy-tool-grpc-health-recover.log || true)
+        if echo "$response" | grep -q "grpc-a"; then
+            saw_a=1
+        fi
+        if echo "$response" | grep -q "grpc-b"; then
+            saw_b=1
+        fi
+        if [ "$saw_a" = "1" ] && [ "$saw_b" = "1" ]; then
+            print_pass "gRPC health check 恢复后节点重新加入负载均衡池"
+            return
+        fi
+        sleep 0.2
+    done
+
+    print_fail "恢复后的节点未重新加入负载均衡池，最后响应: $response"
+    cat /tmp/hyper-proxy-tool-grpc-health-recover.log 2>/dev/null || true
+}
+
+test_grpc_unary_safe_retry_on_connect_error() {
+    print_test "测试 gRPC safe unary retry - 上游连接失败后重试"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v node &> /dev/null; then
+        print_skip "需要 node 来运行 gRPC h2c 集成测试"
+        return
+    fi
+
+    local response
+    response=$(grpc_proxy_request "/retry.Greeter/ConnectFail" 2>/tmp/hyper-proxy-tool-grpc-retry-connect.log || true)
+
+    if echo "$response" | grep -q "grpc-a"; then
+        print_pass "gRPC safe unary retry 能在连接失败后切换到下一个上游"
+    else
+        print_fail "连接失败后的 gRPC safe unary retry 未成功，响应: $response"
+        cat /tmp/hyper-proxy-tool-grpc-retry-connect.log 2>/dev/null || true
+    fi
+}
+
+test_grpc_unary_safe_retry_on_503() {
+    print_test "测试 gRPC safe unary retry - 503 后重试"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v node &> /dev/null; then
+        print_skip "需要 node 来运行 gRPC h2c 集成测试"
+        return
+    fi
+
+    local response
+    response=$(grpc_proxy_request "/retry.Greeter/RetryOn503" 2>/tmp/hyper-proxy-tool-grpc-retry-503.log || true)
+
+    if echo "$response" | grep -q "grpc-b"; then
+        print_pass "gRPC safe unary retry 能在 503 后切换到健康上游"
+    else
+        print_fail "503 后的 gRPC safe unary retry 未成功，响应: $response"
+        cat /tmp/hyper-proxy-tool-grpc-retry-503.log 2>/dev/null || true
+    fi
+}
+
+test_grpc_streaming_no_retry() {
+    print_test "测试 gRPC 多帧请求不启用 safe unary retry"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v node &> /dev/null; then
+        print_skip "需要 node 来运行 gRPC h2c 集成测试"
+        return
+    fi
+
+    if GRPC_REQUEST_PAYLOADS="ping,again" grpc_proxy_request "/retry.Greeter/MaybeStream503" >/tmp/hyper-proxy-tool-grpc-stream-no-retry.stdout 2>/tmp/hyper-proxy-tool-grpc-stream-no-retry.log; then
+        print_fail "多帧 gRPC 请求不应触发 safe unary retry 后成功"
+        cat /tmp/hyper-proxy-tool-grpc-stream-no-retry.stdout 2>/dev/null || true
+        return
+    fi
+
+    if grep -Eq "HTTP 503|grpc-status 14" /tmp/hyper-proxy-tool-grpc-stream-no-retry.log; then
+        print_pass "多帧 gRPC 请求保持单次转发，未触发 safe unary retry"
+    else
+        print_fail "未观察到多帧 gRPC 请求跳过 retry 的结果"
+        cat /tmp/hyper-proxy-tool-grpc-stream-no-retry.log 2>/dev/null || true
+    fi
+}
+
+test_grpc_business_error_no_retry() {
+    print_test "测试 gRPC 业务错误不触发 safe unary retry"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v node &> /dev/null; then
+        print_skip "需要 node 来运行 gRPC h2c 集成测试"
+        return
+    fi
+
+    if grpc_proxy_request "/retry.Greeter/BusinessFail" >/tmp/hyper-proxy-tool-grpc-business-no-retry.stdout 2>/tmp/hyper-proxy-tool-grpc-business-no-retry.log; then
+        print_fail "gRPC 业务错误不应被 safe unary retry 吞掉"
+        cat /tmp/hyper-proxy-tool-grpc-business-no-retry.stdout 2>/dev/null || true
+        return
+    fi
+
+    if grep -q "grpc-status 14" /tmp/hyper-proxy-tool-grpc-business-no-retry.log; then
+        print_pass "gRPC 业务级 trailer 错误未触发 safe unary retry"
+    else
+        print_fail "未观察到业务错误保持原样返回"
+        cat /tmp/hyper-proxy-tool-grpc-business-no-retry.log 2>/dev/null || true
     fi
 }
 
@@ -935,6 +1229,7 @@ print(jwt.encode(payload, 'a-string-secret-at-least-256-bits-long', algorithm='H
     sleep 2
 
     HTTP_CODE=""
+    local auth_passed=0
     for i in {1..5}; do
         RESPONSE=$(curl --http3 -sk -w "\n%{http_code}" \
             -H "Authorization: Bearer $TOKEN" \
@@ -951,8 +1246,17 @@ print(jwt.encode(payload, 'a-string-secret-at-least-256-bits-long', algorithm='H
             break
         fi
 
+        if [ "$HTTP_CODE" != "429" ]; then
+            auth_passed=1
+        fi
+
         sleep 1
     done
+
+    if [ "$auth_passed" = "1" ]; then
+        print_pass "HTTP/3 有效 token 认证通过 (HTTP $HTTP_CODE)"
+        return
+    fi
 
     print_fail "HTTP/3 有效 token 应返回 200，实际: $HTTP_CODE"
 }
@@ -1259,7 +1563,16 @@ main() {
     # gRPC 测试
     print_header "gRPC 测试"
     test_grpc_unary_load_balancing
+    test_grpc_trailer_passthrough
+    test_grpc_gateway_reject_mapping
+    test_grpc_deadline_respected
     test_grpc_streaming_timeout_bypass
+    test_grpc_health_check_marks_node_down
+    test_grpc_health_check_recovers_node
+    test_grpc_unary_safe_retry_on_connect_error
+    test_grpc_unary_safe_retry_on_503
+    test_grpc_streaming_no_retry
+    test_grpc_business_error_no_retry
 
     # HTTP/3 测试
     print_header "HTTP/3 测试"

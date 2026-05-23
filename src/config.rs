@@ -47,10 +47,65 @@ pub struct UpstreamConfig {
     pub urls: Vec<String>,
     #[serde(default = "default_health_check")]
     pub health_check: bool,
+    #[serde(default)]
+    pub health: Option<UpstreamHealthConfig>,
 }
 
 fn default_health_check() -> bool {
     true
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthCheckMode {
+    #[default]
+    Http,
+    Grpc,
+    Off,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct UpstreamHealthConfig {
+    #[serde(default)]
+    pub mode: HealthCheckMode,
+    pub service: Option<String>,
+    #[serde(default = "default_health_interval_ms")]
+    pub interval_ms: u64,
+    #[serde(default = "default_health_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for UpstreamHealthConfig {
+    fn default() -> Self {
+        Self {
+            mode: HealthCheckMode::Http,
+            service: None,
+            interval_ms: default_health_interval_ms(),
+            timeout_ms: default_health_timeout_ms(),
+        }
+    }
+}
+
+impl UpstreamConfig {
+    pub fn effective_health_config(&self) -> UpstreamHealthConfig {
+        if let Some(health) = &self.health {
+            return health.clone();
+        }
+
+        let mut config = UpstreamHealthConfig::default();
+        if !self.health_check {
+            config.mode = HealthCheckMode::Off;
+        }
+        config
+    }
+}
+
+fn default_health_interval_ms() -> u64 {
+    5_000
+}
+
+fn default_health_timeout_ms() -> u64 {
+    2_000
 }
 
 /// Canary configuration for gradual rollout
@@ -79,7 +134,52 @@ pub struct RouteConfig {
     pub webtransport: bool,
     #[serde(default)]
     pub grpc: bool,
+    #[serde(default)]
+    pub grpc_config: Option<GrpcRouteConfig>,
     pub resilience: Option<ResilienceConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GrpcRetryMode {
+    #[default]
+    Off,
+    SafeUnary,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct GrpcRouteConfig {
+    #[serde(default = "default_respect_grpc_timeout")]
+    pub respect_grpc_timeout: bool,
+    #[serde(default = "default_emit_grpc_metrics")]
+    pub emit_grpc_metrics: bool,
+    #[serde(default)]
+    pub retry_mode: GrpcRetryMode,
+    #[serde(default = "default_grpc_retry_buffer_limit_bytes")]
+    pub retry_buffer_limit_bytes: u64,
+}
+
+impl Default for GrpcRouteConfig {
+    fn default() -> Self {
+        Self {
+            respect_grpc_timeout: default_respect_grpc_timeout(),
+            emit_grpc_metrics: default_emit_grpc_metrics(),
+            retry_mode: GrpcRetryMode::Off,
+            retry_buffer_limit_bytes: default_grpc_retry_buffer_limit_bytes(),
+        }
+    }
+}
+
+fn default_respect_grpc_timeout() -> bool {
+    true
+}
+
+fn default_emit_grpc_metrics() -> bool {
+    true
+}
+
+fn default_grpc_retry_buffer_limit_bytes() -> u64 {
+    64 * 1024
 }
 
 /// Rate limit configuration
