@@ -15,7 +15,7 @@ A high-performance, feature-rich proxy service implemented in Rust 2024.
 ### Features
 
 - **Multi-Protocol Support**: HTTP/1.1, HTTP/2, and HTTP/3.
-- **gRPC Proxying**: HTTP/2 gRPC routing and load balancing to h2c upstreams.
+- **gRPC Proxying**: HTTP/2 and HTTP/3 ingress routing with load balancing to HTTP/2 gRPC upstreams.
 - **Advanced Upgrades**: Seamless handling of WebSocket and WebTransport.
 - **TLS & ACME**: Automated certificate management.
 - **Observability**: Built-in metrics and telemetry integration.
@@ -43,6 +43,7 @@ The project includes several utility scripts for testing:
 
 - `./test.sh`: Main integration test suite.
 - `node grpc-server.js`: gRPC h2c upstream server for local proxy tests.
+- `cargo run --bin grpc_http3_client -- /helloworld.Greeter/SayHello`: HTTP/3 gRPC client test.
 - `uv run test_webtransport.py`: WebTransport client test.
 - `uv run test_wt_upstream.py`: WebTransport echo upstream server.
 - `node ws-server.js`: WebSocket upstream server for testing.
@@ -65,7 +66,7 @@ The project includes several utility scripts for testing:
 ### 功能特性
 
 - **多协议支持**: 全面支持 HTTP/1.1, HTTP/2 和 HTTP/3。
-- **gRPC 代理**: 支持基于 HTTP/2 的 gRPC 路由与 h2c 上游负载均衡。
+- **gRPC 代理**: 支持基于 HTTP/2 与 HTTP/3 入站的 gRPC 路由，并转发到 HTTP/2 gRPC 上游。
 - **协议升级**: 无缝处理 WebSocket 和 WebTransport 连接。
 - **TLS 与 ACME**: 自动化的证书管理与配置。
 - **可观测性**: 内置指标（Metrics）采集与遥测（Telemetry）集成。
@@ -93,6 +94,7 @@ cargo run -- --config config.toml
 
 - `./test.sh`: 完整的集成测试套件。
 - `node grpc-server.js`: 本地 gRPC h2c 上游测试服务器。
+- `cargo run --bin grpc_http3_client -- /helloworld.Greeter/SayHello`: HTTP/3 gRPC 客户端测试脚本。
 - `uv run test_webtransport.py`: WebTransport 客户端测试脚本。
 - `uv run test_wt_upstream.py`: WebTransport Echo 上游测试服务器。
 - `node ws-server.js`: 用于测试的 WebSocket 上游服务器。
@@ -104,9 +106,9 @@ cargo run -- --config config.toml
 - `config.toml`: 示例配置文件。
 - `gateway_plugin.wasm`: 示例 WASM 插件。
 
-### gRPC h2c 配置示例
+### gRPC 配置示例
 
-gRPC v2 支持显式 `grpc = true` 的 HTTP/2 路由，并使用 HTTP/2 prior knowledge 转发到 `http://` h2c 上游。对于 gRPC 服务，可以直接为 upstream 配置 `grpc.health.v1.Health/Check` 健康检查。
+显式 `grpc = true` 的路由现在同时支持 HTTP/2 和 HTTP/3 入站请求，并统一使用 HTTP/2 转发到 `http://` h2c 或 `https://` gRPC 上游。对于 gRPC 服务，可以直接为 upstream 配置 `grpc.health.v1.Health/Check` 健康检查。
 
 ```toml
 [upstreams.grpc_backend]
@@ -137,6 +139,8 @@ strip_prefix = false
 retry_mode = "safe_unary"
 retry_buffer_limit_bytes = 65536
 ```
+
+当前 HTTP/3 gRPC 入站仍沿用现有 HTTP/3 请求体策略：请求体会先在网关侧缓冲，默认上限 64 KiB。这个阶段已经支持 unary、server-streaming，以及基于精确 method 路由的 `safe_unary` retry；更完整的双向流式透传仍需要后续演进。
 
 ---
 

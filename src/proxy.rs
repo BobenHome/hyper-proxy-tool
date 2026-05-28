@@ -239,6 +239,13 @@ fn pipeline_reject_to_http_response(
 fn pipeline_reject_to_http3_response(
     reject: &PipelineReject,
 ) -> Response<BoxBody<Bytes, ProxyError>> {
+    if matches!(reject.response_kind, RejectResponseKind::Grpc) {
+        return grpc::grpc_trailers_only_response(
+            grpc::grpc_code_for_reject(reject.reason),
+            reject.message.clone(),
+        );
+    }
+
     Response::builder()
         .status(reject.status)
         .body(
@@ -338,6 +345,47 @@ fn build_forward_uri(upstream_base: &Uri, final_path: &str) -> Option<Uri> {
     let base_trimmed = base_str.trim_end_matches('/');
     let uri_string = format!("{}{}", base_trimmed, final_path);
     uri_string.parse::<Uri>().ok()
+}
+
+fn should_forward_request_header(
+    name: &hyper::header::HeaderName,
+    value: &hyper::header::HeaderValue,
+    is_grpc: bool,
+) -> bool {
+    match name.as_str() {
+        "host" | "connection" | "proxy-connection" | "keep-alive" | "upgrade"
+        | "transfer-encoding" | "http2-settings" | "alt-used" => false,
+        "te" => {
+            is_grpc
+                && value
+                    .to_str()
+                    .map(|v| v.eq_ignore_ascii_case("trailers"))
+                    .unwrap_or(false)
+        }
+        _ => true,
+    }
+}
+
+fn apply_forward_request_headers(
+    mut builder: hyper::http::request::Builder,
+    headers: &hyper::HeaderMap,
+    upstream_base: &Uri,
+    remote_addr: SocketAddr,
+    is_grpc: bool,
+) -> hyper::http::request::Builder {
+    for (name, value) in headers {
+        if should_forward_request_header(name, value, is_grpc) {
+            builder = builder.header(name, value);
+        }
+    }
+
+    if let Some(authority) = upstream_base.authority() {
+        builder = builder.header("host", authority.as_str());
+    } else if let Some(host) = upstream_base.host() {
+        builder = builder.header("host", host);
+    }
+
+    builder.header("x-forwarded-for", remote_addr.ip().to_string())
 }
 
 fn select_available_upstream(plan: &ForwardPlan) -> Option<&str> {
@@ -675,27 +723,37 @@ async fn handle_grpc_safe_unary_request(
     }
 
     let body_bytes = body.collect().await?.to_bytes();
+    dispatch_grpc_buffered_request(ctx, body_bytes).await
+}
+
+async fn dispatch_grpc_buffered_request(
+    ctx: GrpcUnaryRequestContext<'_>,
+    body_bytes: Bytes,
+) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError> {
+    let retry_limit = grpc_retry_buffer_limit(ctx.plan);
     let body_len = body_bytes.len() as u64;
     let has_single_frame = is_single_grpc_request_frame(body_bytes.as_ref());
-    let retry_allowed = body_len <= retry_limit && has_single_frame;
+    let retry_allowed = ctx.plan.grpc_retry_eligible && body_len <= retry_limit && has_single_frame;
 
-    if !retry_allowed {
-        if body_len > retry_limit {
-            info!(
-                "Skipping gRPC safe unary retry for {} because buffered body {} exceeds limit {}",
-                ctx.plan.final_path, body_len, retry_limit
-            );
+    if ctx.plan.grpc_retry_eligible {
+        if !retry_allowed {
+            if body_len > retry_limit {
+                info!(
+                    "Skipping gRPC safe unary retry for {} because buffered body {} exceeds limit {}",
+                    ctx.plan.final_path, body_len, retry_limit
+                );
+            } else {
+                info!(
+                    "Skipping gRPC safe unary retry for {} because request body is not a single gRPC frame",
+                    ctx.plan.final_path
+                );
+            }
         } else {
             info!(
-                "Skipping gRPC safe unary retry for {} because request body is not a single gRPC frame",
-                ctx.plan.final_path
+                "gRPC safe unary retry enabled for {} with buffer {} bytes",
+                ctx.plan.final_path, body_len
             );
         }
-    } else {
-        info!(
-            "gRPC safe unary retry enabled for {} with buffer {} bytes",
-            ctx.plan.final_path, body_len
-        );
     }
 
     let max_attempts = if retry_allowed {
@@ -760,17 +818,17 @@ async fn send_buffered_grpc_request(
             return Ok(resp);
         };
 
-        let mut builder = Request::builder()
+        let builder = Request::builder()
             .method(ctx.parts.method.clone())
             .uri(new_uri)
             .version(Version::HTTP_2);
-        for (k, v) in &ctx.parts.headers {
-            builder = builder.header(k, v);
-        }
-        if let Some(host) = upstream_base.host() {
-            builder = builder.header("Host", host);
-        }
-        builder = builder.header("x-forwarded-for", ctx.remote_addr.ip().to_string());
+        let mut builder = apply_forward_request_headers(
+            builder,
+            &ctx.parts.headers,
+            &upstream_base,
+            ctx.remote_addr,
+            true,
+        );
 
         let trace_ctx = tracing::Span::current().context();
         if let Some(headers) = builder.headers_mut() {
@@ -1038,17 +1096,17 @@ async fn handle_buffered_request(
             Err(_) => continue,
         };
 
-        let mut builder = Request::builder()
+        let builder = Request::builder()
             .method(parts.method.clone())
             .uri(new_uri)
             .version(parts.version);
-        for (k, v) in &parts.headers {
-            builder = builder.header(k, v);
-        }
-        if let Some(host) = upstream_base.host() {
-            builder = builder.header("Host", host);
-        }
-        builder = builder.header("x-forwarded-for", remote_addr.ip().to_string());
+        let mut builder = apply_forward_request_headers(
+            builder,
+            &parts.headers,
+            &upstream_base,
+            remote_addr,
+            false,
+        );
 
         // Tracing injection
         let ctx = tracing::Span::current().context();
@@ -1261,17 +1319,17 @@ async fn handle_streaming_request(
         parts.version
     };
 
-    let mut builder = Request::builder()
+    let builder = Request::builder()
         .method(parts.method)
         .uri(new_uri)
         .version(upstream_version);
-    for (k, v) in &parts.headers {
-        builder = builder.header(k, v);
-    }
-    if let Some(host) = upstream_base.host() {
-        builder = builder.header("Host", host);
-    }
-    builder = builder.header("x-forwarded-for", remote_addr.ip().to_string());
+    let mut builder = apply_forward_request_headers(
+        builder,
+        &parts.headers,
+        &upstream_base,
+        remote_addr,
+        matches!(plan.protocol, ProtocolKind::Grpc),
+    );
 
     let ctx = tracing::Span::current().context();
     if let Some(headers) = builder.headers_mut() {
@@ -1394,6 +1452,7 @@ pub async fn handle_http3_request(
     req: hyper::Request<()>,
     mut stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     client: Arc<HttpClient>,
+    grpc_client: Arc<HttpClient>,
     config: Arc<arc_swap::ArcSwap<AppConfig>>,
     state: Arc<AppState>,
     remote_addr: SocketAddr,
@@ -1436,6 +1495,7 @@ pub async fn handle_http3_request(
             remote_addr,
         },
         client,
+        grpc_client,
         config,
         state,
     )
@@ -1462,15 +1522,24 @@ pub async fn handle_http3_request(
     let mut resp_body = resp_body;
     while let Some(frame_result) = resp_body.frame().await {
         match frame_result {
-            Ok(frame) => {
-                if let Ok(data) = frame.into_data()
-                    && !data.is_empty()
-                    && let Err(e) = stream.send_data(data).await
-                {
-                    error!("Failed to send HTTP/3 response body: {:?}", e);
-                    return;
+            Ok(frame) => match frame.into_data() {
+                Ok(data) => {
+                    if !data.is_empty()
+                        && let Err(e) = stream.send_data(data).await
+                    {
+                        error!("Failed to send HTTP/3 response body: {:?}", e);
+                        return;
+                    }
                 }
-            }
+                Err(frame) => {
+                    if let Ok(trailers) = frame.into_trailers()
+                        && let Err(e) = stream.send_trailers(trailers).await
+                    {
+                        error!("Failed to send HTTP/3 response trailers: {:?}", e);
+                        return;
+                    }
+                }
+            },
             Err(e) => {
                 error!("Failed to read HTTP/3 response body: {:?}", e);
                 return;
@@ -1487,6 +1556,7 @@ pub async fn handle_http3_request(
 async fn proxy_http3_request(
     req: Http3ProxyRequest,
     client: Arc<HttpClient>,
+    grpc_client: Arc<HttpClient>,
     config: Arc<arc_swap::ArcSwap<AppConfig>>,
     state: Arc<AppState>,
 ) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError> {
@@ -1511,6 +1581,7 @@ async fn proxy_http3_request(
             if matches!(reject.reason, pipeline::RejectReason::RouteNotFound) {
                 info!("HTTP/3 No route matched for path: {}", req.uri.path());
             }
+            let is_grpc_reject = matches!(reject.response_kind, RejectResponseKind::Grpc);
             let resp = pipeline_reject_to_http3_response(&reject);
             record_metrics(
                 &method_str,
@@ -1518,15 +1589,29 @@ async fn proxy_http3_request(
                 &reject.metrics_upstream,
                 start,
             );
+            if is_grpc_reject {
+                record_grpc_reject_from_path(req.uri.path(), &reject, start);
+            }
             return Ok(resp);
         }
         PipelineDecision::Forward(plan) => plan,
     };
 
+    let is_grpc = matches!(plan.protocol, ProtocolKind::Grpc);
     if plan.is_canary {
         info!(
             "HTTP/3 Canary hit! Routing to {}",
             plan.target_upstream_name
+        );
+    }
+
+    if is_grpc {
+        info!(
+            "gRPC over HTTP/3 route accepted: path={} final_path={} upstream_pool={} safe_unary_retry={}",
+            plan.original_path,
+            plan.final_path,
+            plan.target_upstream_name,
+            plan.grpc_retry_eligible
         );
     }
 
@@ -1554,6 +1639,31 @@ async fn proxy_http3_request(
         && let Ok(val) = hyper::header::HeaderValue::from_str(&claim.sub)
     {
         req_headers.insert("X-User-Id", val);
+    }
+
+    if is_grpc {
+        let grpc_req = Request::builder()
+            .method(req.method)
+            .uri(req.uri)
+            .version(Version::HTTP_3)
+            .body(())
+            .map_err(|err| {
+                crate::error::error(format!(
+                    "Failed to build HTTP/3 gRPC request shell: {}",
+                    err
+                ))
+            })?;
+        let (mut parts, _) = grpc_req.into_parts();
+        parts.headers = req_headers;
+        let ctx = GrpcUnaryRequestContext {
+            parts,
+            client: grpc_client,
+            plan: &plan,
+            remote_addr: req.remote_addr,
+            method_str: &method_str,
+            start,
+        };
+        return dispatch_grpc_buffered_request(ctx, req.body).await;
     }
 
     // Build and send upstream request
@@ -1593,17 +1703,17 @@ async fn proxy_http3_request(
             Err(_) => continue,
         };
 
-        let mut builder = Request::builder()
+        let builder = Request::builder()
             .method(req.method.clone())
             .uri(new_uri)
             .version(Version::HTTP_11);
-        for (k, v) in &req_headers {
-            builder = builder.header(k, v);
-        }
-        if let Some(host) = upstream_base.host() {
-            builder = builder.header("Host", host);
-        }
-        builder = builder.header("x-forwarded-for", req.remote_addr.ip().to_string());
+        let mut builder = apply_forward_request_headers(
+            builder,
+            &req_headers,
+            &upstream_base,
+            req.remote_addr,
+            false,
+        );
 
         // Tracing injection
         let ctx = tracing::Span::current().context();

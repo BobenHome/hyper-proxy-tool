@@ -121,6 +121,7 @@ webtransport = true
   fallback_status = 503
   fallback_body = "upstream temporarily unavailable"
 
+# gRPC routes accept both HTTP/2 and HTTP/3 ingress and forward upstream over HTTP/2.
 [[routes]]
 path = "/helloworld.Greeter"
 upstream = "grpc_backend"

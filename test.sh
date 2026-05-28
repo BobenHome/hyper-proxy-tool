@@ -19,6 +19,7 @@ SERVER_URL="https://localhost:8443"
 LOCAL_UPSTREAM_PID=""
 WT_UPSTREAM_PID=""
 GRPC_UPSTREAM_PIDS=""
+GRPC_HTTP3_CLIENT_READY=0
 
 # 测试计数器
 TESTS_PASSED=0
@@ -70,6 +71,10 @@ set_grpc_health_status() {
     printf '%s\n' "$status" > "$(grpc_health_file "$name")"
 }
 
+is_local_http_upstream_ready() {
+    curl -s --connect-timeout 1 "http://127.0.0.1:9443/get" 2>/dev/null | grep -q '"httpbin":[[:space:]]*"local-mock"'
+}
+
 # 启动本地 HTTP 上游，供 stable upstream (http://127.0.0.1:9443) 使用。
 # 只监听 TCP 9443，不影响 WebTransport 上游使用同一端口的 UDP/QUIC。
 start_local_upstream() {
@@ -77,7 +82,7 @@ start_local_upstream() {
         return
     fi
 
-    if curl -s --connect-timeout 1 "http://127.0.0.1:9443/get" > /dev/null 2>&1; then
+    if is_local_http_upstream_ready; then
         print_pass "本地 HTTP 测试上游已运行"
         return
     fi
@@ -88,6 +93,22 @@ start_local_upstream() {
     fi
 
     print_test "启动本地 HTTP 测试上游 (127.0.0.1:9443)"
+
+    if command -v lsof &> /dev/null; then
+        local existing_pids
+        existing_pids="$(lsof -t -nP -iTCP:9443 -sTCP:LISTEN 2>/dev/null || true)"
+        if [ -n "$existing_pids" ]; then
+            print_test "清理已占用端口 9443 的旧 HTTP 测试上游进程: $existing_pids"
+            for pid in $existing_pids; do
+                {
+                    kill "$pid" || true
+                    sleep 0.2
+                    kill -9 "$pid" || true
+                    wait "$pid" || true
+                } 2>/dev/null
+            done
+        fi
+    fi
 
     (
         cd "$SCRIPT_DIR"
@@ -148,7 +169,7 @@ PY
     LOCAL_UPSTREAM_PID=$!
 
     for i in {1..20}; do
-        if curl -s --connect-timeout 1 "http://127.0.0.1:9443/get" > /dev/null 2>&1; then
+        if is_local_http_upstream_ready; then
             echo "$LOCAL_UPSTREAM_PID" > /tmp/hyper-proxy-tool-upstream.pid
             print_pass "本地 HTTP 测试上游启动成功 (PID: $LOCAL_UPSTREAM_PID)"
             return
@@ -775,6 +796,22 @@ grpc_proxy_request() {
     SERVER_URL="${SERVER_URL/localhost/127.0.0.1}" node "$SCRIPT_DIR/test_grpc_client.js" "$path"
 }
 
+grpc_http3_proxy_request() {
+    local path="$1"
+    local h3_server_url="${SERVER_URL/localhost/127.0.0.1}"
+    local client_bin="$SCRIPT_DIR/target/debug/grpc_http3_client"
+
+    if [ "$GRPC_HTTP3_CLIENT_READY" -ne 1 ]; then
+        if ! cargo build --quiet --bin grpc_http3_client >/tmp/hyper-proxy-tool-grpc-http3-build.log 2>&1; then
+            cat /tmp/hyper-proxy-tool-grpc-http3-build.log 2>/dev/null || true
+            return 2
+        fi
+        GRPC_HTTP3_CLIENT_READY=1
+    fi
+
+    SERVER_URL="$h3_server_url" "$client_bin" "$path"
+}
+
 test_grpc_unary_load_balancing() {
     print_test "测试 gRPC over HTTP/2 h2c 代理与负载均衡"
 
@@ -830,10 +867,10 @@ test_grpc_trailer_passthrough() {
         return
     fi
 
-    if grep -q "grpc-status 14" /tmp/hyper-proxy-tool-grpc-fail.log; then
+    if grep -q "grpc-status 14 upstream unavailable" /tmp/hyper-proxy-tool-grpc-fail.log; then
         print_pass "gRPC 非 0 trailer 状态成功透传给客户端"
     else
-        print_fail "未观察到透传的 grpc-status 14"
+        print_fail "未观察到透传的 grpc-status 14 upstream unavailable"
         cat /tmp/hyper-proxy-tool-grpc-fail.log 2>/dev/null || true
     fi
 }
@@ -1107,6 +1144,154 @@ test_grpc_business_error_no_retry() {
     else
         print_fail "未观察到业务错误保持原样返回"
         cat /tmp/hyper-proxy-tool-grpc-business-no-retry.log 2>/dev/null || true
+    fi
+}
+
+test_grpc_http3_unary_load_balancing() {
+    print_test "测试 gRPC over HTTP/3 代理与负载均衡"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC over HTTP/3 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v cargo &> /dev/null; then
+        print_skip "需要 cargo 来运行 gRPC over HTTP/3 集成测试"
+        return
+    fi
+
+    local seen_a=0
+    local seen_b=0
+    local response=""
+
+    for _ in {1..6}; do
+        response=$(grpc_http3_proxy_request "/helloworld.Greeter/SayHello" 2>/tmp/hyper-proxy-tool-grpc-http3-client.log || true)
+        if echo "$response" | grep -q "grpc-a"; then
+            seen_a=1
+        fi
+        if echo "$response" | grep -q "grpc-b"; then
+            seen_b=1
+        fi
+        if [ "$seen_a" = "1" ] && [ "$seen_b" = "1" ]; then
+            print_pass "gRPC over HTTP/3 unary 请求通过代理并命中两个上游"
+            return
+        fi
+        sleep 0.2
+    done
+
+    print_fail "gRPC over HTTP/3 负载均衡未命中两个上游，最后响应: $response"
+    cat /tmp/hyper-proxy-tool-grpc-http3-client.log 2>/dev/null || true
+}
+
+test_grpc_http3_trailer_passthrough() {
+    print_test "测试 gRPC over HTTP/3 trailer 透传"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC over HTTP/3 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v cargo &> /dev/null; then
+        print_skip "需要 cargo 来运行 gRPC over HTTP/3 集成测试"
+        return
+    fi
+
+    if grpc_http3_proxy_request "/helloworld.Greeter/Fail" >/tmp/hyper-proxy-tool-grpc-http3-fail.stdout 2>/tmp/hyper-proxy-tool-grpc-http3-fail.log; then
+        print_fail "gRPC over HTTP/3 trailer 非 0 状态应导致客户端失败"
+        cat /tmp/hyper-proxy-tool-grpc-http3-fail.stdout 2>/dev/null || true
+        return
+    fi
+
+    if grep -q "grpc-status 14 upstream unavailable" /tmp/hyper-proxy-tool-grpc-http3-fail.log; then
+        print_pass "gRPC over HTTP/3 非 0 trailer 状态成功透传给客户端"
+    else
+        print_fail "未观察到 HTTP/3 透传的 grpc-status 14 upstream unavailable"
+        cat /tmp/hyper-proxy-tool-grpc-http3-fail.log 2>/dev/null || true
+    fi
+}
+
+test_grpc_http3_gateway_reject_mapping() {
+    print_test "测试 HTTP/3 网关本地 gRPC 拒绝映射"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC over HTTP/3 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v cargo &> /dev/null; then
+        print_skip "需要 cargo 来运行 gRPC over HTTP/3 集成测试"
+        return
+    fi
+
+    if grpc_http3_proxy_request "/secure.Greeter/SayHello" >/tmp/hyper-proxy-tool-grpc-http3-secure.stdout 2>/tmp/hyper-proxy-tool-grpc-http3-secure.log; then
+        print_fail "缺少鉴权的 HTTP/3 gRPC 请求应被网关拒绝"
+        cat /tmp/hyper-proxy-tool-grpc-http3-secure.stdout 2>/dev/null || true
+        return
+    fi
+
+    if grep -q "grpc-status 16" /tmp/hyper-proxy-tool-grpc-http3-secure.log; then
+        print_pass "HTTP/3 网关本地鉴权拒绝已映射为 gRPC UNAUTHENTICATED"
+    else
+        print_fail "未观察到 HTTP/3 grpc-status 16"
+        cat /tmp/hyper-proxy-tool-grpc-http3-secure.log 2>/dev/null || true
+    fi
+}
+
+test_grpc_http3_deadline_respected() {
+    print_test "测试 HTTP/3 gRPC grpc-timeout deadline 生效"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC over HTTP/3 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v cargo &> /dev/null; then
+        print_skip "需要 cargo 来运行 gRPC over HTTP/3 集成测试"
+        return
+    fi
+
+    local start_ts
+    local end_ts
+    local elapsed
+
+    start_ts=$(date +%s)
+    if GRPC_TIMEOUT_HEADER="1S" grpc_http3_proxy_request "/helloworld.Greeter/Slow" >/tmp/hyper-proxy-tool-grpc-http3-deadline.stdout 2>/tmp/hyper-proxy-tool-grpc-http3-deadline.log; then
+        print_fail "设置 grpc-timeout 后的 HTTP/3 慢请求应返回 deadline exceeded"
+        cat /tmp/hyper-proxy-tool-grpc-http3-deadline.stdout 2>/dev/null || true
+        return
+    fi
+    end_ts=$(date +%s)
+    elapsed=$((end_ts - start_ts))
+
+    if grep -q "grpc-status 4" /tmp/hyper-proxy-tool-grpc-http3-deadline.log && [ "$elapsed" -lt 10 ]; then
+        print_pass "HTTP/3 grpc-timeout 已在网关生效并返回 DEADLINE_EXCEEDED"
+    else
+        print_fail "HTTP/3 grpc-timeout 未按预期触发 deadline exceeded，耗时 ${elapsed}s"
+        cat /tmp/hyper-proxy-tool-grpc-http3-deadline.log 2>/dev/null || true
+    fi
+}
+
+test_grpc_http3_unary_safe_retry_on_503() {
+    print_test "测试 HTTP/3 gRPC safe unary retry - 503 后重试"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC over HTTP/3 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v cargo &> /dev/null; then
+        print_skip "需要 cargo 来运行 gRPC over HTTP/3 集成测试"
+        return
+    fi
+
+    local response
+    response=$(grpc_http3_proxy_request "/retry.Greeter/RetryOn503" 2>/tmp/hyper-proxy-tool-grpc-http3-retry-503.log || true)
+
+    if echo "$response" | grep -q "grpc-b"; then
+        print_pass "HTTP/3 gRPC safe unary retry 能在 503 后切换到健康上游"
+    else
+        print_fail "HTTP/3 503 后的 gRPC safe unary retry 未成功，响应: $response"
+        cat /tmp/hyper-proxy-tool-grpc-http3-retry-503.log 2>/dev/null || true
     fi
 }
 
@@ -1573,6 +1758,11 @@ main() {
     test_grpc_unary_safe_retry_on_503
     test_grpc_streaming_no_retry
     test_grpc_business_error_no_retry
+    test_grpc_http3_unary_load_balancing
+    test_grpc_http3_trailer_passthrough
+    test_grpc_http3_gateway_reject_mapping
+    test_grpc_http3_deadline_respected
+    test_grpc_http3_unary_safe_retry_on_503
 
     # HTTP/3 测试
     print_header "HTTP/3 测试"

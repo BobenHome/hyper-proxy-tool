@@ -274,11 +274,11 @@ fn check_grpc_route(ctx: &RequestContext<'_>, route: &RouteConfig) -> Result<boo
         return Ok(false);
     }
 
-    if ctx.protocol != ProtocolKind::Http2 {
+    if !matches!(ctx.protocol, ProtocolKind::Http2 | ProtocolKind::Http3) {
         return Err(make_reject(
             StatusCode::UPGRADE_REQUIRED,
             RejectReason::GrpcInvalidProtocol,
-            "gRPC routes require HTTP/2",
+            "gRPC routes require HTTP/2 or HTTP/3",
             route.upstream.clone(),
             RejectResponseKind::Http,
         ));
@@ -707,6 +707,28 @@ mod tests {
                 assert_eq!(reject.response_kind, RejectResponseKind::Http);
             }
             _ => panic!("expected gRPC content-type rejection"),
+        }
+    }
+
+    #[test]
+    fn accepts_grpc_route_over_http3() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/grpc"));
+
+        let decision = evaluate_test_request(
+            grpc_route("/helloworld.Greeter"),
+            ProtocolKind::Http3,
+            Method::POST,
+            "/helloworld.Greeter/SayHello",
+            headers,
+        );
+
+        match decision {
+            PipelineDecision::Forward(plan) => {
+                assert_eq!(plan.protocol, ProtocolKind::Grpc);
+                assert!(plan.grpc_transport_validated);
+            }
+            _ => panic!("expected gRPC forward plan over HTTP/3"),
         }
     }
 

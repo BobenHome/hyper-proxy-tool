@@ -2,6 +2,7 @@
 name = "hyper-proxy-tool"
 version = "0.1.0"
 edition = "2024"
+default-run = "hyper-proxy-tool"
 
 [dependencies]
 hyper = { version = "1", features = ["full"] }

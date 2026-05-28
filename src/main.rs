@@ -272,12 +272,14 @@ async fn main() -> Result<(), error::ProxyError> {
 
     // HTTP/3 background task
     let quic_client = client.clone();
+    let quic_grpc_client = grpc_client.clone();
     let quic_config = app_config.clone();
     let quic_state = app_state.clone();
 
     tokio::spawn(async move {
         while let Some(incoming_conn) = quic_endpoint.accept().await {
             let client = quic_client.clone();
+            let grpc_client = quic_grpc_client.clone();
             let config = quic_config.clone();
             let state = quic_state.clone();
 
@@ -343,6 +345,7 @@ async fn main() -> Result<(), error::ProxyError> {
                                 break;
                             } else {
                                 let client = client.clone();
+                                let grpc_client = grpc_client.clone();
                                 let config = config.clone();
                                 let state = state.clone();
                                 tokio::spawn(async move {
@@ -350,6 +353,7 @@ async fn main() -> Result<(), error::ProxyError> {
                                         req,
                                         stream,
                                         client,
+                                        grpc_client,
                                         config,
                                         state,
                                         remote_addr,
