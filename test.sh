@@ -1295,6 +1295,78 @@ test_grpc_http3_unary_safe_retry_on_503() {
     fi
 }
 
+test_grpc_http3_streaming_multiframe_request() {
+    print_test "测试 HTTP/3 gRPC 多 DATA frame 请求流式转发"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC over HTTP/3 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v cargo &> /dev/null; then
+        print_skip "需要 cargo 来运行 gRPC over HTTP/3 集成测试"
+        return
+    fi
+
+    local response
+    response=$(GRPC_REQUEST_PAYLOADS="one,two,three" grpc_http3_proxy_request "/helloworld.Greeter/EchoRequestStats" 2>/tmp/hyper-proxy-tool-grpc-http3-streaming.log || true)
+
+    if echo "$response" | grep -q "frames=3"; then
+        print_pass "HTTP/3 gRPC 多 DATA frame 请求已流式转发到上游"
+    else
+        print_fail "HTTP/3 gRPC 多 DATA frame 请求未按预期透传，响应: $response"
+        cat /tmp/hyper-proxy-tool-grpc-http3-streaming.log 2>/dev/null || true
+    fi
+}
+
+test_grpc_http3_request_trailer_passthrough() {
+    print_test "测试 HTTP/3 gRPC request trailer 透传"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC over HTTP/3 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v cargo &> /dev/null; then
+        print_skip "需要 cargo 来运行 gRPC over HTTP/3 集成测试"
+        return
+    fi
+
+    local response
+    response=$(GRPC_REQUEST_TRAILER_VALUE="h3-request-trailer-ok" grpc_http3_proxy_request "/helloworld.Greeter/EchoRequestStats" 2>/tmp/hyper-proxy-tool-grpc-http3-request-trailer.log || true)
+
+    if echo "$response" | grep -q "trailer=h3-request-trailer-ok"; then
+        print_pass "HTTP/3 gRPC request trailer 已透传到上游"
+    else
+        print_fail "HTTP/3 gRPC request trailer 未透传到上游，响应: $response"
+        cat /tmp/hyper-proxy-tool-grpc-http3-request-trailer.log 2>/dev/null || true
+    fi
+}
+
+test_grpc_http3_large_streaming_request() {
+    print_test "测试 HTTP/3 gRPC 大请求体不再受 64KiB 入站缓冲限制"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC over HTTP/3 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v cargo &> /dev/null; then
+        print_skip "需要 cargo 来运行 gRPC over HTTP/3 集成测试"
+        return
+    fi
+
+    local response
+    response=$(GRPC_LARGE_PAYLOAD_BYTES="70000" grpc_http3_proxy_request "/helloworld.Greeter/EchoRequestStats" 2>/tmp/hyper-proxy-tool-grpc-http3-large.log || true)
+
+    if echo "$response" | grep -q "frames=1" && echo "$response" | grep -q "bytes=70005"; then
+        print_pass "HTTP/3 gRPC 大请求体已通过流式路径转发"
+    else
+        print_fail "HTTP/3 gRPC 大请求体未按预期转发，响应: $response"
+        cat /tmp/hyper-proxy-tool-grpc-http3-large.log 2>/dev/null || true
+    fi
+}
+
 # 测试 Alt-Svc 头
 test_alt_svc() {
     print_test "测试 Alt-Svc 头 (HTTP/3 支持)"
@@ -1763,6 +1835,9 @@ main() {
     test_grpc_http3_gateway_reject_mapping
     test_grpc_http3_deadline_respected
     test_grpc_http3_unary_safe_retry_on_503
+    test_grpc_http3_streaming_multiframe_request
+    test_grpc_http3_request_trailer_passthrough
+    test_grpc_http3_large_streaming_request
 
     # HTTP/3 测试
     print_header "HTTP/3 测试"

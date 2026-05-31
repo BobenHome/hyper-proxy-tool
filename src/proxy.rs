@@ -32,11 +32,16 @@ use crate::websocket::{handle_websocket, is_websocket_request};
 
 const MAX_BUFFER_SIZE: u64 = 64 * 1024;
 
-struct Http3ProxyRequest {
+type Http3BidiStream = h3_quinn::BidiStream<Bytes>;
+type Http3RecvStream = h3_quinn::RecvStream;
+type Http3SendStream = h3_quinn::SendStream<Bytes>;
+type Http3RequestStream<S> = h3::server::RequestStream<S, Bytes>;
+
+struct Http3ProxyRequest<B> {
     method: hyper::Method,
     uri: hyper::Uri,
     headers: hyper::HeaderMap,
-    body: bytes::Bytes,
+    body: B,
     remote_addr: SocketAddr,
 }
 
@@ -47,6 +52,17 @@ struct GrpcUnaryRequestContext<'a> {
     remote_addr: SocketAddr,
     method_str: &'a str,
     start: Instant,
+}
+
+struct Http3IncomingBody {
+    stream: Http3RequestStream<Http3RecvStream>,
+    state: Http3IncomingBodyState,
+}
+
+enum Http3IncomingBodyState {
+    Data,
+    Trailers,
+    Done,
 }
 
 struct GrpcObservedBody<B> {
@@ -121,6 +137,75 @@ impl<B> GrpcObservedBody<B> {
                 self.start,
             );
         }
+    }
+}
+
+impl Http3IncomingBody {
+    fn new(stream: Http3RequestStream<Http3RecvStream>) -> Self {
+        Self {
+            stream,
+            state: Http3IncomingBodyState::Data,
+        }
+    }
+}
+
+impl HyperBody for Http3IncomingBody {
+    type Data = Bytes;
+    type Error = ProxyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        loop {
+            match self.state {
+                Http3IncomingBodyState::Data => match self.stream.poll_recv_data(cx) {
+                    Poll::Ready(Ok(Some(mut data))) => {
+                        use bytes::Buf;
+                        let chunk = data.copy_to_bytes(data.remaining());
+                        return Poll::Ready(Some(Ok(Frame::data(chunk))));
+                    }
+                    Poll::Ready(Ok(None)) => {
+                        self.state = Http3IncomingBodyState::Trailers;
+                    }
+                    Poll::Ready(Err(err)) => {
+                        self.state = Http3IncomingBodyState::Done;
+                        return Poll::Ready(Some(Err(crate::error::error(format!(
+                            "failed to read HTTP/3 request body: {:?}",
+                            err
+                        )))));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
+                Http3IncomingBodyState::Trailers => match self.stream.poll_recv_trailers(cx) {
+                    Poll::Ready(Ok(Some(trailers))) => {
+                        self.state = Http3IncomingBodyState::Done;
+                        return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+                    }
+                    Poll::Ready(Ok(None)) => {
+                        self.state = Http3IncomingBodyState::Done;
+                        return Poll::Ready(None);
+                    }
+                    Poll::Ready(Err(err)) => {
+                        self.state = Http3IncomingBodyState::Done;
+                        return Poll::Ready(Some(Err(crate::error::error(format!(
+                            "failed to read HTTP/3 request trailers: {:?}",
+                            err
+                        )))));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
+                Http3IncomingBodyState::Done => return Poll::Ready(None),
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        matches!(self.state, Http3IncomingBodyState::Done)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
     }
 }
 
@@ -1247,15 +1332,19 @@ async fn handle_buffered_request(
     Ok(resp)
 }
 
-async fn handle_streaming_request(
+async fn handle_streaming_request<B>(
     parts: hyper::http::request::Parts,
-    body: Incoming,
+    body: B,
     client: Arc<HttpClient>,
     plan: &ForwardPlan,
     remote_addr: SocketAddr,
     method_str: &str,
     start: Instant,
-) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError> {
+) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError>
+where
+    B: HyperBody<Data = Bytes> + Send + Sync + 'static,
+    B::Error: Into<ProxyError>,
+{
     let Some(upstream_url_str) = select_available_upstream(plan) else {
         warn!(
             "No available streaming upstream node for {}",
@@ -1338,7 +1427,7 @@ async fn handle_streaming_request(
         });
     }
 
-    let streaming_req = match builder.body(body.map_err(|e| Box::new(e) as ProxyError).boxed()) {
+    let streaming_req = match builder.body(body.map_err(Into::into).boxed()) {
         Ok(r) => r,
         Err(_) => {
             if matches!(plan.protocol, ProtocolKind::Grpc) {
@@ -1447,51 +1536,38 @@ async fn handle_streaming_request(
     }
 }
 
+async fn collect_limited_http3_body<B>(body: B) -> Result<Option<Bytes>, ProxyError>
+where
+    B: HyperBody<Data = Bytes, Error = ProxyError>,
+{
+    let collected = body.collect().await?;
+    let body_bytes = collected.to_bytes();
+    if body_bytes.len() > MAX_BUFFER_SIZE as usize {
+        warn!("HTTP/3 request body too large");
+        return Ok(None);
+    }
+    Ok(Some(body_bytes))
+}
+
 /// Handle HTTP/3 request stream
 pub async fn handle_http3_request(
     req: hyper::Request<()>,
-    mut stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    stream: Http3RequestStream<Http3BidiStream>,
     client: Arc<HttpClient>,
     grpc_client: Arc<HttpClient>,
     config: Arc<arc_swap::ArcSwap<AppConfig>>,
     state: Arc<AppState>,
     remote_addr: SocketAddr,
 ) {
-    // Read request body
-    let mut body_bytes = bytes::BytesMut::new();
-    loop {
-        match stream.recv_data().await {
-            Ok(Some(mut data)) => {
-                use bytes::Buf;
-                while data.remaining() > 0 {
-                    let chunk = data.copy_to_bytes(data.remaining());
-                    if body_bytes.len() + chunk.len() > MAX_BUFFER_SIZE as usize {
-                        warn!("HTTP/3 request body too large");
-                        let error_resp = Response::builder()
-                            .status(StatusCode::PAYLOAD_TOO_LARGE)
-                            .body(())
-                            .unwrap();
-                        let _ = stream.send_response(error_resp).await;
-                        let _ = stream.finish().await;
-                        return;
-                    }
-                    body_bytes.extend_from_slice(&chunk);
-                }
-            }
-            Ok(None) => break,
-            Err(e) => {
-                error!("Failed to read HTTP/3 request body: {:?}", e);
-                return;
-            }
-        }
-    }
+    let (send_stream, recv_stream) = stream.split();
+    let body = Http3IncomingBody::new(recv_stream);
 
     let resp = match proxy_http3_request(
         Http3ProxyRequest {
             method: req.method().clone(),
             uri: req.uri().clone(),
             headers: req.headers().clone(),
-            body: bytes::Bytes::from(body_bytes),
+            body,
             remote_addr,
         },
         client,
@@ -1505,12 +1581,20 @@ pub async fn handle_http3_request(
         Err(e) => {
             error!("HTTP/3 proxy_handler error: {:?}", e);
             let error_resp = Response::builder().status(502).body(()).unwrap();
-            let _ = stream.send_response(error_resp).await;
-            let _ = stream.finish().await;
+            let mut send_stream = send_stream;
+            let _ = send_stream.send_response(error_resp).await;
+            let _ = send_stream.finish().await;
             return;
         }
     };
 
+    send_http3_response(send_stream, resp).await;
+}
+
+async fn send_http3_response(
+    mut stream: Http3RequestStream<Http3SendStream>,
+    resp: Response<BoxBody<Bytes, ProxyError>>,
+) {
     let (resp_parts, resp_body) = resp.into_parts();
     let h3_resp = Response::from_parts(resp_parts, ());
 
@@ -1553,13 +1637,16 @@ pub async fn handle_http3_request(
 }
 
 /// HTTP/3 proxy request handler
-async fn proxy_http3_request(
-    req: Http3ProxyRequest,
+async fn proxy_http3_request<B>(
+    req: Http3ProxyRequest<B>,
     client: Arc<HttpClient>,
     grpc_client: Arc<HttpClient>,
     config: Arc<arc_swap::ArcSwap<AppConfig>>,
     state: Arc<AppState>,
-) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError> {
+) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError>
+where
+    B: HyperBody<Data = Bytes, Error = ProxyError> + Send + Sync + 'static,
+{
     let start = Instant::now();
     let method_str = req.method.to_string();
     let current_config = config.load_full();
@@ -1663,11 +1750,30 @@ async fn proxy_http3_request(
             method_str: &method_str,
             start,
         };
-        return dispatch_grpc_buffered_request(ctx, req.body).await;
+        if plan.grpc_retry_eligible {
+            let collected = req.body.collect().await?;
+            return dispatch_grpc_buffered_request(ctx, collected.to_bytes()).await;
+        }
+        return handle_streaming_request(
+            ctx.parts,
+            req.body,
+            ctx.client,
+            ctx.plan,
+            ctx.remote_addr,
+            ctx.method_str,
+            ctx.start,
+        )
+        .await;
     }
 
     // Build and send upstream request
-    let body_full = Full::new(req.body);
+    let Some(body_bytes) = collect_limited_http3_body(req.body).await? else {
+        return Ok(Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .body(Empty::new().map_err(|e| match e {}).boxed())
+            .unwrap());
+    };
+    let body_full = Full::new(body_bytes);
     let max_failover_attempts = max_request_attempts(&plan);
     let mut last_error: Option<String> = None;
 

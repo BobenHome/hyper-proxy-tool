@@ -28,6 +28,11 @@ async fn main() -> Result<(), AnyError> {
         .unwrap_or_else(|| "/helloworld.Greeter/SayHello".to_string());
     let grpc_timeout = env::var("GRPC_TIMEOUT_HEADER").unwrap_or_default();
     let bearer_token = env::var("BEARER_TOKEN").unwrap_or_default();
+    let request_trailer_value = env::var("GRPC_REQUEST_TRAILER_VALUE").unwrap_or_default();
+    let large_payload_bytes = env::var("GRPC_LARGE_PAYLOAD_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
     let request_payloads = env::var("GRPC_REQUEST_PAYLOADS")
         .unwrap_or_else(|_| "ping".to_string())
         .split(',')
@@ -68,12 +73,27 @@ async fn main() -> Result<(), AnyError> {
     let request = builder.body(())?;
 
     let mut request_stream = send_request.send_request(request).await?;
-    let body_bytes = request_payloads
-        .iter()
-        .flat_map(|payload| grpc_frame(payload.as_bytes()).to_vec())
-        .collect::<Vec<_>>();
-    request_stream.send_data(Bytes::from(body_bytes)).await?;
-    request_stream.finish().await?;
+    if large_payload_bytes > 0 {
+        let payload = vec![b'x'; large_payload_bytes];
+        request_stream.send_data(grpc_frame(&payload)).await?;
+    } else {
+        for payload in &request_payloads {
+            request_stream
+                .send_data(grpc_frame(payload.as_bytes()))
+                .await?;
+        }
+    }
+    if request_trailer_value.is_empty() {
+        request_stream.finish().await?;
+    } else {
+        let mut trailers = hyper::HeaderMap::new();
+        trailers.insert(
+            "x-grpc-test-trailer",
+            hyper::header::HeaderValue::from_str(&request_trailer_value)?,
+        );
+        request_stream.send_trailers(trailers).await?;
+        request_stream.finish().await?;
+    }
 
     let response = request_stream.recv_response().await?;
     let status = response.status().as_u16();

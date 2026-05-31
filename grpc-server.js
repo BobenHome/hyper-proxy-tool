@@ -62,9 +62,32 @@ function sendGrpcResponse(stream, payload, trailers, delay = 0) {
     }
 }
 
+function decodeGrpcFrames(buffer) {
+    const frames = [];
+    let offset = 0;
+    while (offset + 5 <= buffer.length) {
+        const compressed = buffer[offset];
+        const length = buffer.readUInt32BE(offset + 1);
+        const start = offset + 5;
+        const end = start + length;
+        if (compressed !== 0 || end > buffer.length) {
+            break;
+        }
+        frames.push(buffer.subarray(start, end));
+        offset = end;
+    }
+    return frames;
+}
+
 server.on("stream", (stream, headers) => {
     const path = headers[":path"] || "";
     const contentType = headers["content-type"] || "";
+    const chunks = [];
+    let requestTrailers = {};
+    stream.on("data", (chunk) => chunks.push(chunk));
+    stream.on("trailers", (trailers) => {
+        requestTrailers = trailers || {};
+    });
 
     if (!String(contentType).startsWith("application/grpc")) {
         stream.respond({ ":status": 415 });
@@ -82,19 +105,6 @@ server.on("stream", (stream, headers) => {
         return;
     }
 
-    if (String(path).endsWith("/Slow")) {
-        sendGrpcResponse(stream, `${name}:slow`, { "grpc-status": "0" }, delayMs);
-        return;
-    }
-
-    if (String(path).endsWith("/Fail")) {
-        sendGrpcResponse(stream, undefined, {
-            "grpc-status": "14",
-            "grpc-message": "upstream unavailable",
-        });
-        return;
-    }
-
     if (String(path).endsWith("/RetryOn503") && name === "grpc-a") {
         stream.respond({ ":status": 503 });
         stream.end("retryable upstream unavailable");
@@ -107,22 +117,49 @@ server.on("stream", (stream, headers) => {
         return;
     }
 
-    if (String(path).endsWith("/BusinessFail") && name === "grpc-a") {
-        sendGrpcResponse(stream, undefined, {
-            "grpc-status": "14",
-            "grpc-message": "business unavailable",
-        });
-        return;
-    }
+    stream.on("end", () => {
+        const requestBody = Buffer.concat(chunks);
 
-    if (String(path).endsWith("/EchoTimeout")) {
-        sendGrpcResponse(stream, String(headers["grpc-timeout"] || ""), {
-            "grpc-status": "0",
-        });
-        return;
-    }
+        if (String(path).endsWith("/Slow")) {
+            sendGrpcResponse(stream, `${name}:slow`, { "grpc-status": "0" }, delayMs);
+            return;
+        }
 
-    sendGrpcResponse(stream, name, { "grpc-status": "0" });
+        if (String(path).endsWith("/Fail")) {
+            sendGrpcResponse(stream, undefined, {
+                "grpc-status": "14",
+                "grpc-message": "upstream unavailable",
+            });
+            return;
+        }
+
+        if (String(path).endsWith("/BusinessFail") && name === "grpc-a") {
+            sendGrpcResponse(stream, undefined, {
+                "grpc-status": "14",
+                "grpc-message": "business unavailable",
+            });
+            return;
+        }
+
+        if (String(path).endsWith("/EchoTimeout")) {
+            sendGrpcResponse(stream, String(headers["grpc-timeout"] || ""), {
+                "grpc-status": "0",
+            });
+            return;
+        }
+
+        if (String(path).endsWith("/EchoRequestStats")) {
+            const frames = decodeGrpcFrames(requestBody);
+            sendGrpcResponse(
+                stream,
+                `${name}:frames=${frames.length}:bytes=${requestBody.length}:trailer=${requestTrailers["x-grpc-test-trailer"] || ""}`,
+                { "grpc-status": "0" },
+            );
+            return;
+        }
+
+        sendGrpcResponse(stream, name, { "grpc-status": "0" });
+    });
 });
 
 server.listen(port, "127.0.0.1", () => {

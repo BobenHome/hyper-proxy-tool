@@ -140,7 +140,7 @@ retry_mode = "safe_unary"
 retry_buffer_limit_bytes = 65536
 ```
 
-当前 HTTP/3 gRPC 入站仍沿用现有 HTTP/3 请求体策略：请求体会先在网关侧缓冲，默认上限 64 KiB。这个阶段已经支持 unary、server-streaming，以及基于精确 method 路由的 `safe_unary` retry；更完整的双向流式透传仍需要后续演进。
+HTTP/3 gRPC 入站请求现在会以流式方式转发到 HTTP/2 上游，支持多 DATA frame 请求和 request trailers 透传，不再受普通 HTTP/3 入站 64 KiB 缓冲限制。基于精确 method 路由的 `safe_unary` retry 仍会按 `retry_buffer_limit_bytes` 缓冲单个 gRPC frame，多帧请求和超限请求会自动回落到单次流式转发。
 
 ---
 
