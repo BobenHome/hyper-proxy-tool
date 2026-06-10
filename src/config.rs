@@ -45,6 +45,8 @@ pub struct TracingConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct UpstreamConfig {
     pub urls: Vec<String>,
+    #[serde(default)]
+    pub protocol: UpstreamProtocol,
     #[serde(default = "default_health_check")]
     pub health_check: bool,
     #[serde(default)]
@@ -53,6 +55,14 @@ pub struct UpstreamConfig {
 
 fn default_health_check() -> bool {
     true
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamProtocol {
+    #[default]
+    Auto,
+    GrpcH3,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]

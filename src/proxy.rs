@@ -15,7 +15,7 @@ use tracing::{error, info, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::cache::parse_cache_max_age;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, UpstreamProtocol};
 use crate::error::ProxyError;
 use crate::grpc::{self, GrpcCode};
 use crate::metrics::{
@@ -410,6 +410,10 @@ fn grpc_retry_buffer_limit(plan: &ForwardPlan) -> u64 {
         .unwrap_or(MAX_BUFFER_SIZE)
 }
 
+fn is_grpc_h3_upstream(plan: &ForwardPlan) -> bool {
+    plan.upstream_protocol == UpstreamProtocol::GrpcH3
+}
+
 fn is_single_grpc_request_frame(body: &[u8]) -> bool {
     if body.len() < 5 || body[0] != 0 {
         return false;
@@ -626,6 +630,46 @@ fn observe_grpc_response(
     Response::from_parts(parts, body)
 }
 
+fn observe_grpc_boxed_response(
+    res: Response<BoxBody<Bytes, ProxyError>>,
+    plan: &ForwardPlan,
+    upstream_url: &str,
+    start: Instant,
+) -> Response<BoxBody<Bytes, ProxyError>> {
+    let (parts, body) = res.into_parts();
+    let timeout = grpc::effective_grpc_timeout(
+        plan.resilience.timeout_duration(),
+        plan.grpc_timeout,
+        plan.grpc_config
+            .as_ref()
+            .map(|cfg| cfg.respect_grpc_timeout)
+            .unwrap_or(true),
+    )
+    .map(|timeout| {
+        timeout
+            .checked_sub(start.elapsed())
+            .unwrap_or(Duration::ZERO)
+    })
+    .map(tokio::time::sleep)
+    .map(Box::pin);
+
+    let body = GrpcObservedBody {
+        inner: body,
+        service: grpc_service_name(plan).to_string(),
+        method: grpc_method_name(plan).to_string(),
+        upstream_pool: plan.target_upstream_name.clone(),
+        upstream_url: upstream_url.to_string(),
+        start,
+        emit_metrics: should_emit_grpc_metrics(plan),
+        timeout,
+        finalized: false,
+        observed_outcome: false,
+    }
+    .boxed();
+
+    Response::from_parts(parts, body)
+}
+
 /// Main proxy handler for HTTP/1.1 and HTTP/2
 #[instrument(skip(client, grpc_client, config, state, req), fields(method = %req.method(), uri = %req.uri()))]
 pub async fn proxy_handler(
@@ -760,7 +804,11 @@ pub async fn proxy_handler(
         parts.headers.insert("X-User-Id", val);
     }
 
-    if is_grpc && plan.grpc_transport_validated && plan.grpc_retry_eligible {
+    if is_grpc
+        && !is_grpc_h3_upstream(&plan)
+        && plan.grpc_transport_validated
+        && plan.grpc_retry_eligible
+    {
         let ctx = GrpcUnaryRequestContext {
             parts,
             client: grpc_client,
@@ -772,7 +820,9 @@ pub async fn proxy_handler(
         return handle_grpc_safe_unary_request(ctx, body, content_length).await;
     }
 
-    if is_grpc {
+    if is_grpc && is_grpc_h3_upstream(&plan) {
+        handle_grpc_h3_streaming_request(parts, body, &plan, remote_addr, &method, start).await
+    } else if is_grpc {
         handle_streaming_request(parts, body, grpc_client, &plan, remote_addr, &method, start).await
     } else if should_buffer {
         handle_buffered_request(parts, body, client, state, &plan, remote_addr, start).await
@@ -1536,6 +1586,184 @@ where
     }
 }
 
+async fn handle_grpc_h3_streaming_request<B>(
+    parts: hyper::http::request::Parts,
+    body: B,
+    plan: &ForwardPlan,
+    remote_addr: SocketAddr,
+    method_str: &str,
+    start: Instant,
+) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError>
+where
+    B: HyperBody<Data = Bytes> + Send + Sync + 'static,
+    B::Error: Into<ProxyError>,
+{
+    let Some(upstream_url_str) = select_available_upstream(plan) else {
+        warn!(
+            "No available gRPC HTTP/3 upstream node for {}",
+            plan.target_upstream_name
+        );
+        record_grpc_plan_outcome(plan, "no_available_upstream", GrpcCode::Unavailable, start);
+        let resp = fallback_response(plan);
+        let status = resp.status().as_u16().to_string();
+        record_metrics(method_str, &status, &plan.target_upstream_name, start);
+        return Ok(resp);
+    };
+
+    let upstream_base = match upstream_url_str.parse::<Uri>() {
+        Ok(uri) => uri,
+        Err(err) => {
+            warn!(
+                "Invalid gRPC HTTP/3 upstream '{}' for {}: {}",
+                upstream_url_str, plan.target_upstream_name, err
+            );
+            record_grpc_plan_outcome(plan, "invalid_upstream_uri", GrpcCode::Unavailable, start);
+            let resp = fallback_response(plan);
+            let status = resp.status().as_u16().to_string();
+            record_metrics(method_str, &status, &plan.target_upstream_name, start);
+            return Ok(resp);
+        }
+    };
+
+    let Some(new_uri) = build_forward_uri(&upstream_base, &plan.final_path) else {
+        record_grpc_plan_outcome(plan, "invalid_forward_uri", GrpcCode::Unavailable, start);
+        let resp = fallback_response(plan);
+        let status = resp.status().as_u16().to_string();
+        record_metrics(method_str, &status, &plan.target_upstream_name, start);
+        return Ok(resp);
+    };
+
+    info!(
+        "gRPC h3 LB -> upstream={} final_path={}",
+        upstream_url_str, plan.final_path
+    );
+
+    let builder = Request::builder()
+        .method(parts.method)
+        .uri(new_uri)
+        .version(Version::HTTP_3);
+    let mut builder =
+        apply_forward_request_headers(builder, &parts.headers, &upstream_base, remote_addr, true);
+
+    let trace_ctx = tracing::Span::current().context();
+    if let Some(headers) = builder.headers_mut() {
+        opentelemetry::global::get_text_map_propagator(|propagator| {
+            propagator.inject_context(&trace_ctx, &mut HeaderInjector(headers))
+        });
+    }
+
+    let upstream_req = match builder.body(body.map_err(Into::into).boxed()) {
+        Ok(req) => req,
+        Err(err) => {
+            record_grpc_plan_outcome(plan, "request_build_failed", GrpcCode::Internal, start);
+            let resp = grpc::grpc_trailers_only_response(
+                GrpcCode::Internal,
+                format!("Failed to build HTTP/3 upstream request: {}", err),
+            );
+            let status = resp.status().as_u16().to_string();
+            record_metrics(method_str, &status, &plan.target_upstream_name, start);
+            return Ok(resp);
+        }
+    };
+
+    let request_fut = crate::grpc_h3::send_grpc_h3_request(&upstream_base, upstream_req);
+    let timeout = grpc::effective_grpc_timeout(
+        plan.resilience.timeout_duration(),
+        plan.grpc_timeout,
+        plan.grpc_config
+            .as_ref()
+            .map(|cfg| cfg.respect_grpc_timeout)
+            .unwrap_or(true),
+    );
+
+    let result = if let Some(timeout) = timeout {
+        match tokio::time::timeout(timeout, request_fut).await {
+            Ok(result) => result,
+            Err(_) => {
+                record_upstream_timeout(method_str, &plan.target_upstream_name);
+                if plan
+                    .upstream_state
+                    .record_node_failure(upstream_url_str, &plan.resilience)
+                {
+                    record_upstream_circuit_open(
+                        method_str,
+                        &plan.target_upstream_name,
+                        upstream_url_str,
+                    );
+                }
+                record_grpc_plan_outcome(
+                    plan,
+                    "deadline_exceeded",
+                    GrpcCode::DeadlineExceeded,
+                    start,
+                );
+                let resp = deadline_exceeded_response(plan, timeout);
+                let status = resp.status().as_u16().to_string();
+                record_metrics(method_str, &status, &plan.target_upstream_name, start);
+                return Ok(resp);
+            }
+        }
+    } else {
+        request_fut.await
+    };
+
+    match result {
+        Ok(res) => {
+            let status_code = res.status();
+            info!(
+                "gRPC HTTP/3 upstream response <- upstream={} status={}",
+                upstream_url_str, status_code
+            );
+            if should_retry_status(status_code) {
+                if plan
+                    .upstream_state
+                    .record_node_failure(upstream_url_str, &plan.resilience)
+                {
+                    record_upstream_circuit_open(
+                        method_str,
+                        &plan.target_upstream_name,
+                        upstream_url_str,
+                    );
+                }
+            } else {
+                plan.upstream_state.record_node_success(upstream_url_str);
+            }
+
+            let status = status_code.as_u16().to_string();
+            record_metrics(method_str, &status, &plan.target_upstream_name, start);
+            Ok(observe_grpc_boxed_response(
+                res,
+                plan,
+                upstream_url_str,
+                start,
+            ))
+        }
+        Err(err) => {
+            error!("gRPC HTTP/3 upstream failed: {:?}", err);
+            if plan
+                .upstream_state
+                .record_node_failure(upstream_url_str, &plan.resilience)
+            {
+                record_upstream_circuit_open(
+                    method_str,
+                    &plan.target_upstream_name,
+                    upstream_url_str,
+                );
+            }
+            record_grpc_plan_outcome(
+                plan,
+                "upstream_transport_error",
+                GrpcCode::Unavailable,
+                start,
+            );
+            let resp = fallback_response(plan);
+            let status = resp.status().as_u16().to_string();
+            record_metrics(method_str, &status, &plan.target_upstream_name, start);
+            Ok(resp)
+        }
+    }
+}
+
 async fn collect_limited_http3_body<B>(body: B) -> Result<Option<Bytes>, ProxyError>
 where
     B: HyperBody<Data = Bytes, Error = ProxyError>,
@@ -1750,9 +1978,20 @@ where
             method_str: &method_str,
             start,
         };
-        if plan.grpc_retry_eligible {
+        if plan.grpc_retry_eligible && !is_grpc_h3_upstream(&plan) {
             let collected = req.body.collect().await?;
             return dispatch_grpc_buffered_request(ctx, collected.to_bytes()).await;
+        }
+        if is_grpc_h3_upstream(&plan) {
+            return handle_grpc_h3_streaming_request(
+                ctx.parts,
+                req.body,
+                ctx.plan,
+                ctx.remote_addr,
+                ctx.method_str,
+                ctx.start,
+            )
+            .await;
         }
         return handle_streaming_request(
             ctx.parts,

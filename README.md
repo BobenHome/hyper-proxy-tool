@@ -108,7 +108,7 @@ cargo run -- --config config.toml
 
 ### gRPC 配置示例
 
-显式 `grpc = true` 的路由现在同时支持 HTTP/2 和 HTTP/3 入站请求，并统一使用 HTTP/2 转发到 `http://` h2c 或 `https://` gRPC 上游。对于 gRPC 服务，可以直接为 upstream 配置 `grpc.health.v1.Health/Check` 健康检查。
+显式 `grpc = true` 的路由现在同时支持 HTTP/2 和 HTTP/3 入站请求。默认情况下，gRPC upstream 继续使用 HTTP/2 转发到 `http://` h2c 或 `https://` gRPC 上游；如果 upstream 配置 `protocol = "grpc_h3"`，则使用 HTTP/3 转发到 QUIC 上游。对于 gRPC 服务，可以直接为 upstream 配置 `grpc.health.v1.Health/Check` 健康检查。
 
 ```toml
 [upstreams.grpc_backend]
@@ -122,6 +122,25 @@ timeout_ms = 2000
 [[routes]]
 path = "/helloworld.Greeter"
 upstream = "grpc_backend"
+grpc = true
+strip_prefix = false
+```
+
+gRPC HTTP/3 upstream 配置示例：
+
+```toml
+[upstreams.grpc_h3_backend]
+urls = ["https://127.0.0.1:50054"]
+protocol = "grpc_h3"
+
+[upstreams.grpc_h3_backend.health]
+mode = "grpc"
+interval_ms = 5000
+timeout_ms = 2000
+
+[[routes]]
+path = "/h3.Greeter"
+upstream = "grpc_h3_backend"
 grpc = true
 strip_prefix = false
 ```
@@ -140,7 +159,7 @@ retry_mode = "safe_unary"
 retry_buffer_limit_bytes = 65536
 ```
 
-HTTP/3 gRPC 入站请求现在会以流式方式转发到 HTTP/2 上游，支持多 DATA frame 请求和 request trailers 透传，不再受普通 HTTP/3 入站 64 KiB 缓冲限制。基于精确 method 路由的 `safe_unary` retry 仍会按 `retry_buffer_limit_bytes` 缓冲单个 gRPC frame，多帧请求和超限请求会自动回落到单次流式转发。
+HTTP/3 gRPC 入站请求现在会以流式方式转发到 HTTP/2 或 HTTP/3 上游，支持多 DATA frame 请求和 request trailers 透传，不再受普通 HTTP/3 入站 64 KiB 缓冲限制。基于精确 method 路由的 `safe_unary` retry 仍会按 `retry_buffer_limit_bytes` 缓冲单个 gRPC frame；`grpc_h3` upstream 默认不执行 streaming request retry。
 
 ---
 

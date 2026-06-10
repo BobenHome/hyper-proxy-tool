@@ -34,6 +34,7 @@ mod canary;
 mod config;
 mod error;
 mod grpc;
+mod grpc_h3;
 mod health;
 mod metrics;
 mod pipeline;

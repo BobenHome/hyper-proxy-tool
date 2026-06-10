@@ -47,6 +47,15 @@ endpoint = "http://localhost:4317"
     interval_ms = 500
     timeout_ms = 1000
 
+  # 本地 gRPC HTTP/3 上游，用于测试端到端 QUIC / HTTP/3 gRPC 转发。
+  [upstreams.grpc_h3_backend]
+  urls = ["https://127.0.0.1:50054"]
+  protocol = "grpc_h3"
+    [upstreams.grpc_h3_backend.health]
+    mode = "grpc"
+    interval_ms = 500
+    timeout_ms = 1000
+
   [upstreams.grpc_retry_connect_backend]
   urls = ["http://127.0.0.1:50053", "http://127.0.0.1:50051"]
   health_check = false
@@ -125,6 +134,12 @@ webtransport = true
 [[routes]]
 path = "/helloworld.Greeter"
 upstream = "grpc_backend"
+strip_prefix = false
+grpc = true
+
+[[routes]]
+path = "/h3.Greeter"
+upstream = "grpc_h3_backend"
 strip_prefix = false
 grpc = true
 

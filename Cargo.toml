@@ -93,3 +93,7 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] } # 控制库
 [[bin]]
 name = "hyper-proxy-tool"
 path = "src/main.rs"
+
+[[bin]]
+name = "grpc_http3_upstream"
+path = "src/bin/grpc_http3_upstream.rs"

@@ -20,6 +20,7 @@ LOCAL_UPSTREAM_PID=""
 WT_UPSTREAM_PID=""
 GRPC_UPSTREAM_PIDS=""
 GRPC_HTTP3_CLIENT_READY=0
+GRPC_HTTP3_UPSTREAM_READY=0
 
 # 测试计数器
 TESTS_PASSED=0
@@ -59,6 +60,10 @@ is_local_server_url() {
             return 1
             ;;
     esac
+}
+
+curl_supports_http3() {
+    command -v curl &> /dev/null && curl --version | grep -q "HTTP3"
 }
 
 grpc_health_file() {
@@ -258,6 +263,60 @@ start_grpc_upstreams() {
     if [ "$started" -gt 0 ]; then
         print_pass "本地 gRPC h2c 测试上游启动成功"
     fi
+}
+
+start_grpc_http3_upstream() {
+    if ! is_local_server_url; then
+        return
+    fi
+
+    if ! command -v cargo &> /dev/null; then
+        print_skip "cargo 不可用，无法启动本地 gRPC HTTP/3 测试上游"
+        return
+    fi
+
+    print_test "启动本地 gRPC HTTP/3 测试上游 (127.0.0.1:50054/UDP)"
+
+    if command -v lsof &> /dev/null; then
+        local existing_pids
+        existing_pids="$(lsof -t -nP -iUDP:50054 2>/dev/null || true)"
+        if [ -n "$existing_pids" ]; then
+            print_test "清理已占用 UDP 50054 的旧 gRPC HTTP/3 测试上游进程: $existing_pids"
+            for pid in $existing_pids; do
+                {
+                    kill "$pid" || true
+                    sleep 0.2
+                    kill -9 "$pid" || true
+                    wait "$pid" || true
+                } 2>/dev/null
+            done
+        fi
+    fi
+
+    if [ "$GRPC_HTTP3_UPSTREAM_READY" -ne 1 ]; then
+        if ! cargo build --quiet --bin grpc_http3_upstream >/tmp/hyper-proxy-tool-grpc-http3-upstream-build.log 2>&1; then
+            print_fail "gRPC HTTP/3 测试上游构建失败"
+            cat /tmp/hyper-proxy-tool-grpc-http3-upstream-build.log 2>/dev/null || true
+            return
+        fi
+        GRPC_HTTP3_UPSTREAM_READY=1
+    fi
+
+    (
+        cd "$SCRIPT_DIR"
+        GRPC_H3_PORT="50054" GRPC_H3_NAME="grpc-h3" "$SCRIPT_DIR/target/debug/grpc_http3_upstream"
+    ) > /tmp/hyper-proxy-tool-grpc-h3.log 2>&1 &
+    local pid=$!
+
+    sleep 0.8
+    if kill -0 "$pid" 2>/dev/null; then
+        GRPC_UPSTREAM_PIDS="$GRPC_UPSTREAM_PIDS $pid"
+        print_pass "本地 gRPC HTTP/3 测试上游启动成功"
+        return
+    fi
+
+    print_fail "本地 gRPC HTTP/3 测试上游启动失败"
+    cat /tmp/hyper-proxy-tool-grpc-h3.log 2>/dev/null || true
 }
 
 stop_grpc_upstreams() {
@@ -1367,6 +1426,81 @@ test_grpc_http3_large_streaming_request() {
     fi
 }
 
+test_grpc_http3_to_http3_upstream_unary() {
+    print_test "测试 gRPC HTTP/3 入站转发到 HTTP/3 上游"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC over HTTP/3 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v cargo &> /dev/null; then
+        print_skip "需要 cargo 来运行 gRPC over HTTP/3 集成测试"
+        return
+    fi
+
+    local response
+    response=$(grpc_http3_proxy_request "/h3.Greeter/SayHello" 2>/tmp/hyper-proxy-tool-grpc-h3-upstream-unary.log || true)
+
+    if echo "$response" | grep -q "grpc-h3"; then
+        print_pass "HTTP/3 入站 gRPC unary 请求已转发到 HTTP/3 上游"
+    else
+        print_fail "HTTP/3 upstream unary 响应不符合预期，响应: $response"
+        cat /tmp/hyper-proxy-tool-grpc-h3-upstream-unary.log 2>/dev/null || true
+    fi
+}
+
+test_grpc_http3_to_http3_upstream_streaming_and_trailers() {
+    print_test "测试 gRPC HTTP/3 上游多 DATA frame 与 request trailer 透传"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC over HTTP/3 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v cargo &> /dev/null; then
+        print_skip "需要 cargo 来运行 gRPC over HTTP/3 集成测试"
+        return
+    fi
+
+    local response
+    response=$(GRPC_REQUEST_PAYLOADS="one,two,three" GRPC_REQUEST_TRAILER_VALUE="h3-upstream-trailer-ok" grpc_http3_proxy_request "/h3.Greeter/EchoRequestStats" 2>/tmp/hyper-proxy-tool-grpc-h3-upstream-streaming.log || true)
+
+    if echo "$response" | grep -q "frames=3" && echo "$response" | grep -q "trailer=h3-upstream-trailer-ok"; then
+        print_pass "HTTP/3 上游收到多 DATA frame 与 request trailer"
+    else
+        print_fail "HTTP/3 上游未按预期收到流式请求或 trailer，响应: $response"
+        cat /tmp/hyper-proxy-tool-grpc-h3-upstream-streaming.log 2>/dev/null || true
+    fi
+}
+
+test_grpc_http3_to_http3_upstream_error_trailer() {
+    print_test "测试 gRPC HTTP/3 上游 response trailer 透传"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC over HTTP/3 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v cargo &> /dev/null; then
+        print_skip "需要 cargo 来运行 gRPC over HTTP/3 集成测试"
+        return
+    fi
+
+    if grpc_http3_proxy_request "/h3.Greeter/Fail" >/tmp/hyper-proxy-tool-grpc-h3-upstream-fail.stdout 2>/tmp/hyper-proxy-tool-grpc-h3-upstream-fail.log; then
+        print_fail "HTTP/3 上游非 0 trailer 状态应导致客户端失败"
+        cat /tmp/hyper-proxy-tool-grpc-h3-upstream-fail.stdout 2>/dev/null || true
+        return
+    fi
+
+    if grep -q "grpc-status 14 http3 upstream unavailable" /tmp/hyper-proxy-tool-grpc-h3-upstream-fail.log; then
+        print_pass "HTTP/3 上游非 0 response trailer 已透传给客户端"
+    else
+        print_fail "未观察到 HTTP/3 上游 grpc-status 14 response trailer"
+        cat /tmp/hyper-proxy-tool-grpc-h3-upstream-fail.log 2>/dev/null || true
+    fi
+}
+
 # 测试 Alt-Svc 头
 test_alt_svc() {
     print_test "测试 Alt-Svc 头 (HTTP/3 支持)"
@@ -1377,6 +1511,11 @@ test_alt_svc() {
     if [ -n "$RESPONSE" ]; then
         print_pass "Alt-Svc 头存在: $RESPONSE"
     else
+        if ! curl_supports_http3; then
+            print_skip "curl 不支持 HTTP/3，跳过 Alt-Svc 兜底连接验证"
+            return
+        fi
+
         # 如果没有 Alt-Svc 头，检查 HTTP/3 是否可用
         HTTP3_RESPONSE=$(curl --http3 -sk -w "\n%{http_code}" "$SERVER_URL/health" 2>&1 || echo "")
         if echo "$HTTP3_RESPONSE" | grep -q "OK"; then
@@ -1390,6 +1529,11 @@ test_alt_svc() {
 # 测试 HTTP/3 支持
 test_http3() {
     print_test "测试 HTTP/3 支持"
+
+    if ! curl_supports_http3; then
+        print_skip "curl 不支持 HTTP/3"
+        return
+    fi
 
     # 测试 1: 尝试直接 HTTP/3 连接
     RESPONSE=$(curl --http3 -sk -w "\n%{http_code}" "$SERVER_URL/health" 2>&1 || echo "")
@@ -1415,31 +1559,66 @@ test_http3() {
 test_http3_ip_rate_limit() {
     print_test "测试 HTTP/3 - IP 限流"
 
-    # 快速发送超过 20 个请求（IP 限流配置为 10 req/s，burst 20）
-    # 使用后台并发请求
-
-    BLOCKED=0
-    TOTAL=0
-
-    for i in {1..25}; do
-        TOTAL=$((TOTAL + 1))
-        HTTP_CODE=$(curl --http3 -sk -o /dev/null -w "%{http_code}" "$SERVER_URL/api/v1/get" 2>/dev/null || echo "000")
-        if [ "$HTTP_CODE" = "429" ]; then
-            BLOCKED=1
-            break
-        fi
-    done
-
-    if [ "$BLOCKED" = "1" ]; then
-        print_pass "HTTP/3 IP 限流生效 (请求 $TOTAL 次后返回 429)"
-    else
-        print_fail "HTTP/3 IP 限流未生效 (发送 $TOTAL 次请求未触发限流)"
+    if ! curl_supports_http3; then
+        print_skip "curl 不支持 HTTP/3"
+        return
     fi
+
+    # 在单个 QUIC 连接内快速打开多条 HTTP/3 request stream。使用不存在的路径，
+    # 避免鉴权、路由限流或上游状态影响，只验证 IP limiter。
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+    local total=40
+    local blocked=0
+    local codes_file="$tmp_dir/codes"
+    local probe_err="$tmp_dir/probe.err"
+
+    if command -v cargo &> /dev/null; then
+        local probe_bin="$SCRIPT_DIR/target/debug/http3_rate_limit_probe"
+        if ! cargo build --quiet --bin http3_rate_limit_probe > "$tmp_dir/build.log" 2>&1; then
+            print_fail "HTTP/3 IP 限流探针构建失败"
+            cat "$tmp_dir/build.log" 2>/dev/null || true
+            rm -rf "$tmp_dir"
+            return
+        fi
+
+        SERVER_URL="${SERVER_URL/localhost/127.0.0.1}" "$probe_bin" "$total" \
+            > "$codes_file" 2> "$probe_err" || true
+    else
+        local urls=()
+        for i in $(seq 1 "$total"); do
+            urls+=("$SERVER_URL/__http3_ip_limit_probe_$i")
+        done
+
+        curl --http3-only -sk --connect-timeout 1 --max-time 10 \
+            --parallel --parallel-immediate --parallel-max "$total" --parallel-max-host "$total" \
+            -o /dev/null -w "%{http_code}\n" \
+            "${urls[@]}" > "$codes_file" 2> "$probe_err" || true
+    fi
+
+    if grep -qx "429" "$codes_file"; then
+        blocked=1
+    fi
+
+    if [ "$blocked" = "1" ]; then
+        print_pass "HTTP/3 IP 限流生效 (并发 $total 次请求观察到 429)"
+    else
+        print_fail "HTTP/3 IP 限流未生效 (并发 $total 次请求未触发限流)"
+        cat "$probe_err" 2>/dev/null || true
+        sort "$codes_file" | uniq -c | sed 's/^/  HTTP code 分布: /'
+    fi
+
+    rm -rf "$tmp_dir"
 }
 
 # 测试 HTTP/3 - JWT 鉴权
 test_http3_jwt_auth() {
     print_test "测试 HTTP/3 - JWT 鉴权"
+
+    if ! curl_supports_http3; then
+        print_skip "curl 不支持 HTTP/3"
+        return
+    fi
 
     # 先等待一段时间让限流恢复
     sleep 2
@@ -1522,6 +1701,11 @@ print(jwt.encode(payload, 'a-string-secret-at-least-256-bits-long', algorithm='H
 test_http3_canary() {
     print_test "测试 HTTP/3 - Canary 灰度"
 
+    if ! curl_supports_http3; then
+        print_skip "curl 不支持 HTTP/3"
+        return
+    fi
+
     # 强制走灰度
     RESPONSE=$(curl --http3 -sk -w "\n%{http_code}" \
         -H "X-Canary: true" \
@@ -1544,6 +1728,11 @@ test_http3_canary() {
 # 测试 HTTP/3 - HTTP 缓存
 test_http3_cache() {
     print_test "测试 HTTP/3 - HTTP 缓存"
+
+    if ! curl_supports_http3; then
+        print_skip "curl 不支持 HTTP/3"
+        return
+    fi
 
     CACHE_PATH="/api/public/cache/60"
 
@@ -1774,6 +1963,7 @@ main() {
 
     start_local_upstream
     start_grpc_upstreams
+    start_grpc_http3_upstream
 
     # 检查或启动服务器
     if [ "$AUTO_START" = true ]; then
@@ -1838,6 +2028,9 @@ main() {
     test_grpc_http3_streaming_multiframe_request
     test_grpc_http3_request_trailer_passthrough
     test_grpc_http3_large_streaming_request
+    test_grpc_http3_to_http3_upstream_unary
+    test_grpc_http3_to_http3_upstream_streaming_and_trailers
+    test_grpc_http3_to_http3_upstream_error_trailer
 
     # HTTP/3 测试
     print_header "HTTP/3 测试"

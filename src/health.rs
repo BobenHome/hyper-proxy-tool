@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::config::{AppConfig, HealthCheckMode, UpstreamHealthConfig};
+use crate::config::{AppConfig, HealthCheckMode, UpstreamHealthConfig, UpstreamProtocol};
 use crate::error::{ProxyError, error};
 use crate::grpc::{self, GrpcCode, HealthServingStatus};
 use crate::state::{AppState, HttpClient};
@@ -77,8 +77,14 @@ pub async fn start_health_check_loop(
                 HealthCheckMode::Http | HealthCheckMode::Grpc => {
                     let mut healthy_urls = Vec::new();
                     for url in &upstream_config.urls {
-                        if check_upstream_with_mode(&client, &grpc_client, url, &health_config)
-                            .await
+                        if check_upstream_with_mode(
+                            &client,
+                            &grpc_client,
+                            url,
+                            &health_config,
+                            upstream_config.protocol,
+                        )
+                        .await
                         {
                             healthy_urls.push(url.clone());
                         } else {
@@ -142,10 +148,14 @@ async fn check_upstream_with_mode(
     grpc_client: &HttpClient,
     url: &str,
     health_config: &UpstreamHealthConfig,
+    upstream_protocol: UpstreamProtocol,
 ) -> bool {
     match health_config.mode {
         HealthCheckMode::Http => {
             check_upstream_http(client, url, health_timeout(health_config)).await
+        }
+        HealthCheckMode::Grpc if upstream_protocol == UpstreamProtocol::GrpcH3 => {
+            check_upstream_grpc_h3(url, health_config).await
         }
         HealthCheckMode::Grpc => check_upstream_grpc(grpc_client, url, health_config).await,
         HealthCheckMode::Off => true,
@@ -190,6 +200,70 @@ pub async fn check_upstream_grpc(
         }
         Err(_) => false,
     }
+}
+
+/// Check if an HTTP/3 upstream is healthy via grpc.health.v1.Health/Check.
+pub async fn check_upstream_grpc_h3(url: &str, health_config: &UpstreamHealthConfig) -> bool {
+    match tokio::time::timeout(
+        health_timeout(health_config),
+        check_upstream_grpc_h3_inner(url, health_config),
+    )
+    .await
+    {
+        Ok(Ok(healthy)) => healthy,
+        Ok(Err(err)) => {
+            warn!(
+                "gRPC HTTP/3 health check request failed for '{}': {}",
+                url, err
+            );
+            false
+        }
+        Err(_) => false,
+    }
+}
+
+async fn check_upstream_grpc_h3_inner(
+    url: &str,
+    health_config: &UpstreamHealthConfig,
+) -> Result<bool, ProxyError> {
+    let uri: Uri = format!("{}/grpc.health.v1.Health/Check", url.trim_end_matches('/'))
+        .parse()
+        .map_err(|e| error(format!("Invalid gRPC HTTP/3 health URI '{}': {}", url, e)))?;
+    let upstream_base: Uri = url
+        .parse()
+        .map_err(|e| error(format!("Invalid gRPC HTTP/3 upstream URI '{}': {}", url, e)))?;
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .version(Version::HTTP_3)
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(full_body(grpc::encode_health_check_request(
+            health_config.service.as_deref(),
+        )))
+        .unwrap();
+
+    let res = crate::grpc_h3::send_grpc_h3_request(&upstream_base, req).await?;
+    if res.status() != StatusCode::OK {
+        return Ok(false);
+    }
+
+    let collected = res.into_body().collect().await?;
+    let trailers = collected
+        .trailers()
+        .cloned()
+        .ok_or_else(|| error("missing grpc HTTP/3 health trailers"))?;
+
+    if grpc::parse_grpc_status(&trailers).unwrap_or(-1) != GrpcCode::Ok.as_i32() {
+        return Ok(false);
+    }
+
+    let body = collected.to_bytes();
+    let status = grpc::decode_health_check_response(&body)
+        .ok_or_else(|| error("invalid grpc HTTP/3 health response body"))?;
+
+    Ok(status == HealthServingStatus::Serving)
 }
 
 async fn check_upstream_grpc_inner(

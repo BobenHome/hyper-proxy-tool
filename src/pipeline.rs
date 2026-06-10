@@ -7,7 +7,9 @@ use hyper::header::{AUTHORIZATION, CONTENT_TYPE};
 use hyper::{HeaderMap, Method, StatusCode, Uri};
 
 use crate::auth::{self, Claims};
-use crate::config::{AppConfig, GrpcRetryMode, GrpcRouteConfig, ResilienceConfig, RouteConfig};
+use crate::config::{
+    AppConfig, GrpcRetryMode, GrpcRouteConfig, ResilienceConfig, RouteConfig, UpstreamProtocol,
+};
 use crate::grpc;
 use crate::plugin::{WasmInput, WasmOutput};
 use crate::state::{AppState, UpstreamState};
@@ -94,6 +96,7 @@ pub struct ForwardPlan {
     pub route: RouteConfig,
     pub claims: Option<Claims>,
     pub target_upstream_name: String,
+    pub upstream_protocol: UpstreamProtocol,
     pub upstream_state: Arc<UpstreamState>,
     pub active_urls: Vec<String>,
     pub original_path: String,
@@ -190,11 +193,21 @@ pub fn evaluate_request(
         crate::canary::select_target_upstream(ctx.headers, &route);
     let target_upstream_name = target_upstream_name.to_string();
 
-    let (upstream_state, active_urls) =
-        match resolve_upstream(&target_upstream_name, state, response_kind) {
+    let (upstream_state, active_urls, upstream_protocol) =
+        match resolve_upstream(&target_upstream_name, &app_config, state, response_kind) {
             Ok(v) => v,
             Err(reject) => return PipelineDecision::Reject(reject),
         };
+
+    if upstream_protocol == UpstreamProtocol::GrpcH3 && !route.grpc {
+        return PipelineDecision::Reject(make_reject(
+            StatusCode::BAD_GATEWAY,
+            RejectReason::UpstreamNotFound,
+            "grpc_h3 upstreams require grpc routes",
+            target_upstream_name.clone(),
+            response_kind,
+        ));
+    }
 
     let path_query = ctx
         .uri
@@ -237,6 +250,7 @@ pub fn evaluate_request(
         route,
         claims,
         target_upstream_name,
+        upstream_protocol,
         upstream_state,
         active_urls,
         original_path: path.to_string(),
@@ -421,9 +435,20 @@ fn run_plugin(
 
 fn resolve_upstream(
     target_upstream_name: &str,
+    app_config: &AppConfig,
     state: &AppState,
     response_kind: RejectResponseKind,
-) -> Result<(Arc<UpstreamState>, Vec<String>), PipelineReject> {
+) -> Result<(Arc<UpstreamState>, Vec<String>, UpstreamProtocol), PipelineReject> {
+    let Some(upstream_config) = app_config.upstreams.get(target_upstream_name) else {
+        return Err(make_reject(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            RejectReason::UpstreamNotFound,
+            "500 Config Error",
+            target_upstream_name.to_string(),
+            response_kind,
+        ));
+    };
+
     let current_state_map = state.upstreams.load();
     let upstream_state = match current_state_map.get(target_upstream_name) {
         Some(state) => state.clone(),
@@ -449,7 +474,7 @@ fn resolve_upstream(
         ));
     }
 
-    Ok((upstream_state, active_urls))
+    Ok((upstream_state, active_urls, upstream_config.protocol))
 }
 
 fn make_reject(
@@ -567,6 +592,16 @@ mod tests {
             "stable".to_string(),
             UpstreamConfig {
                 urls: vec!["http://127.0.0.1:50051".to_string()],
+                protocol: UpstreamProtocol::Auto,
+                health_check: false,
+                health: None,
+            },
+        );
+        upstreams.insert(
+            "grpc_h3".to_string(),
+            UpstreamConfig {
+                urls: vec!["https://127.0.0.1:50054".to_string()],
+                protocol: UpstreamProtocol::GrpcH3,
                 health_check: false,
                 health: None,
             },
@@ -872,6 +907,46 @@ mod tests {
         match decision {
             PipelineDecision::Forward(plan) => assert!(!plan.grpc_retry_eligible),
             _ => panic!("expected gRPC forward plan"),
+        }
+    }
+
+    #[test]
+    fn grpc_route_can_target_grpc_h3_upstream() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/grpc"));
+
+        let decision = evaluate_test_request(
+            grpc_route_with_upstream("/h3.Greeter", "grpc_h3"),
+            ProtocolKind::Http3,
+            Method::POST,
+            "/h3.Greeter/SayHello",
+            headers,
+        );
+
+        match decision {
+            PipelineDecision::Forward(plan) => {
+                assert_eq!(plan.protocol, ProtocolKind::Grpc);
+                assert_eq!(plan.upstream_protocol, UpstreamProtocol::GrpcH3);
+            }
+            _ => panic!("expected grpc_h3 forward plan"),
+        }
+    }
+
+    #[test]
+    fn non_grpc_route_rejects_grpc_h3_upstream() {
+        let headers = HeaderMap::new();
+        let mut route = route("/api", false);
+        route.upstream = "grpc_h3".to_string();
+
+        let decision =
+            evaluate_test_request(route, ProtocolKind::Http1, Method::GET, "/api", headers);
+
+        match decision {
+            PipelineDecision::Reject(reject) => {
+                assert_eq!(reject.reason, RejectReason::UpstreamNotFound);
+                assert_eq!(reject.status, StatusCode::BAD_GATEWAY);
+            }
+            _ => panic!("expected grpc_h3 non-gRPC rejection"),
         }
     }
 }
