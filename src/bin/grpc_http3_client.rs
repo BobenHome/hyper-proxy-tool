@@ -160,7 +160,7 @@ async fn main() -> Result<(), AnyError> {
         std::process::exit(1);
     }
 
-    let payload = decode_grpc_payload(&body).unwrap_or_default();
+    let payload = decode_grpc_payloads(&body).join("|");
     println!("{payload}");
     Ok(())
 }
@@ -188,17 +188,29 @@ fn grpc_frame(payload: &[u8]) -> Bytes {
     Bytes::from(frame)
 }
 
-fn decode_grpc_payload(bytes: &[u8]) -> Option<String> {
-    if bytes.len() < 5 || bytes[0] != 0 {
-        return None;
+fn decode_grpc_payloads(bytes: &[u8]) -> Vec<String> {
+    let mut payloads = Vec::new();
+    let mut offset = 0;
+
+    while offset + 5 <= bytes.len() {
+        if bytes[offset] != 0 {
+            break;
+        }
+
+        let len = u32::from_be_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
+        let start = offset + 5;
+        let end = start + len;
+        if end > bytes.len() {
+            break;
+        }
+
+        if let Ok(payload) = String::from_utf8(bytes[start..end].to_vec()) {
+            payloads.push(payload);
+        }
+        offset = end;
     }
 
-    let len = u32::from_be_bytes(bytes[1..5].try_into().ok()?) as usize;
-    if bytes.len() < len + 5 {
-        return None;
-    }
-
-    String::from_utf8(bytes[5..5 + len].to_vec()).ok()
+    payloads
 }
 
 #[derive(Debug)]

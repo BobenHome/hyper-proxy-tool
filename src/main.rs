@@ -246,6 +246,8 @@ async fn main() -> Result<(), error::ProxyError> {
                                     .plugins
                                     .store(Arc::new(new_state_parts.plugins));
 
+                                grpc_h3::clear_connection_pool().await;
+
                                 cancel_token.cancel();
                                 let _ = health_handle.await;
                                 info!("Old health check task stopped.");

@@ -8,8 +8,12 @@ use std::env;
 use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 type AnyError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+static NEXT_CONNECTION_ID: AtomicUsize = AtomicUsize::new(1);
 
 #[tokio::main]
 async fn main() -> Result<(), AnyError> {
@@ -38,6 +42,8 @@ async fn main() -> Result<(), AnyError> {
                 }
             };
 
+            let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+            let quinn_connection = connection.clone();
             let h3_conn = H3QuinnConnection::new(connection);
             let mut h3_server_conn = match server::builder().build::<_, Bytes>(h3_conn).await {
                 Ok(conn) => conn,
@@ -51,6 +57,7 @@ async fn main() -> Result<(), AnyError> {
                 match h3_server_conn.accept().await {
                     Ok(Some(resolver)) => {
                         let name = name.clone();
+                        let quinn_connection = quinn_connection.clone();
                         tokio::spawn(async move {
                             let (req, stream) = match resolver.resolve_request().await {
                                 Ok(value) => value,
@@ -59,7 +66,10 @@ async fn main() -> Result<(), AnyError> {
                                     return;
                                 }
                             };
-                            if let Err(err) = handle_request(req, stream, name).await {
+                            if let Err(err) =
+                                handle_request(req, stream, name, connection_id, quinn_connection)
+                                    .await
+                            {
                                 eprintln!("HTTP/3 upstream request failed: {err:?}");
                             }
                         });
@@ -81,6 +91,8 @@ async fn handle_request(
     req: Request<()>,
     mut stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     name: String,
+    connection_id: usize,
+    quinn_connection: quinn::Connection,
 ) -> Result<(), AnyError> {
     let path = req.uri().path().to_string();
     let content_type = req
@@ -107,10 +119,46 @@ async fn handle_request(
     }
     let request_trailers = stream.recv_trailers().await?.unwrap_or_default();
 
-    let (payload, trailers) = if path == "/grpc.health.v1.Health/Check" {
-        (Some(encode_health_response(1)), grpc_trailers("0", ""))
+    if path.ends_with("/StreamChunks") {
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/grpc")
+            .body(())?;
+        stream.send_response(resp).await?;
+        stream.send_data(grpc_frame(b"chunk-1")).await?;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        stream.send_data(grpc_frame(b"chunk-2")).await?;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        stream.send_data(grpc_frame(b"chunk-3")).await?;
+        stream.send_trailers(grpc_trailers("0", "")).await?;
+        stream.finish().await?;
+        return Ok(());
+    }
+
+    let (payload, trailers, close_connection) = if path == "/grpc.health.v1.Health/Check" {
+        (
+            Some(encode_health_response(1)),
+            grpc_trailers("0", ""),
+            false,
+        )
     } else if path.ends_with("/Fail") {
-        (None, grpc_trailers("14", "http3 upstream unavailable"))
+        (
+            None,
+            grpc_trailers("14", "http3 upstream unavailable"),
+            false,
+        )
+    } else if path.ends_with("/ConnectionId") {
+        (
+            Some(format!("conn={connection_id}")),
+            grpc_trailers("0", ""),
+            false,
+        )
+    } else if path.ends_with("/CloseConnection") {
+        (
+            Some(format!("closing-conn={connection_id}")),
+            grpc_trailers("0", ""),
+            true,
+        )
     } else if path.ends_with("/EchoRequestStats") {
         let frames = decode_grpc_frames(&request_body);
         let trailer = request_trailers
@@ -125,9 +173,10 @@ async fn handle_request(
                 trailer
             )),
             grpc_trailers("0", ""),
+            false,
         )
     } else {
-        (Some(name), grpc_trailers("0", ""))
+        (Some(name), grpc_trailers("0", ""), false)
     };
 
     let resp = Response::builder()
@@ -140,6 +189,12 @@ async fn handle_request(
     }
     stream.send_trailers(trailers).await?;
     stream.finish().await?;
+    if close_connection {
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            quinn_connection.close(0u32.into(), b"test close");
+        });
+    }
     Ok(())
 }
 

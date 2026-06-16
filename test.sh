@@ -1501,6 +1501,85 @@ test_grpc_http3_to_http3_upstream_error_trailer() {
     fi
 }
 
+test_grpc_http3_to_http3_upstream_response_streaming() {
+    print_test "测试 gRPC HTTP/3 上游 response 多 DATA frame 流式透传"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC over HTTP/3 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v cargo &> /dev/null; then
+        print_skip "需要 cargo 来运行 gRPC over HTTP/3 集成测试"
+        return
+    fi
+
+    local response
+    response=$(grpc_http3_proxy_request "/h3.Greeter/StreamChunks" 2>/tmp/hyper-proxy-tool-grpc-h3-upstream-response-streaming.log || true)
+
+    if echo "$response" | grep -q "chunk-1" && echo "$response" | grep -q "chunk-2" && echo "$response" | grep -q "chunk-3"; then
+        print_pass "HTTP/3 上游多 DATA frame response 已透传到客户端"
+    else
+        print_fail "HTTP/3 上游 response streaming 响应不符合预期，响应: $response"
+        cat /tmp/hyper-proxy-tool-grpc-h3-upstream-response-streaming.log 2>/dev/null || true
+    fi
+}
+
+test_grpc_http3_upstream_connection_reuse() {
+    print_test "测试 gRPC HTTP/3 上游 QUIC 连接复用"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC over HTTP/3 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v cargo &> /dev/null; then
+        print_skip "需要 cargo 来运行 gRPC over HTTP/3 集成测试"
+        return
+    fi
+
+    local first
+    local second
+    first=$(grpc_http3_proxy_request "/h3.Greeter/ConnectionId" 2>/tmp/hyper-proxy-tool-grpc-h3-upstream-conn-reuse-1.log || true)
+    second=$(grpc_http3_proxy_request "/h3.Greeter/ConnectionId" 2>/tmp/hyper-proxy-tool-grpc-h3-upstream-conn-reuse-2.log || true)
+
+    if [ -n "$first" ] && [ "$first" = "$second" ] && echo "$first" | grep -q '^conn='; then
+        print_pass "连续 gRPC/H3 upstream 请求复用了同一条 QUIC connection ($first)"
+    else
+        print_fail "连续 gRPC/H3 upstream 请求未复用连接，first=$first second=$second"
+        cat /tmp/hyper-proxy-tool-grpc-h3-upstream-conn-reuse-1.log 2>/dev/null || true
+        cat /tmp/hyper-proxy-tool-grpc-h3-upstream-conn-reuse-2.log 2>/dev/null || true
+    fi
+}
+
+test_grpc_http3_upstream_reconnect_after_close() {
+    print_test "测试 gRPC HTTP/3 上游连接关闭后自动重连"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC over HTTP/3 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v cargo &> /dev/null; then
+        print_skip "需要 cargo 来运行 gRPC over HTTP/3 集成测试"
+        return
+    fi
+
+    local closed
+    local next
+    closed=$(grpc_http3_proxy_request "/h3.Greeter/CloseConnection" 2>/tmp/hyper-proxy-tool-grpc-h3-upstream-close.log || true)
+    sleep 0.3
+    next=$(grpc_http3_proxy_request "/h3.Greeter/ConnectionId" 2>/tmp/hyper-proxy-tool-grpc-h3-upstream-reconnect.log || true)
+
+    if echo "$closed" | grep -q '^closing-conn=' && echo "$next" | grep -q '^conn='; then
+        print_pass "gRPC/H3 upstream 连接关闭后下一次请求已自动重连"
+    else
+        print_fail "gRPC/H3 upstream 连接关闭后未能自动重连，closed=$closed next=$next"
+        cat /tmp/hyper-proxy-tool-grpc-h3-upstream-close.log 2>/dev/null || true
+        cat /tmp/hyper-proxy-tool-grpc-h3-upstream-reconnect.log 2>/dev/null || true
+    fi
+}
+
 # 测试 Alt-Svc 头
 test_alt_svc() {
     print_test "测试 Alt-Svc 头 (HTTP/3 支持)"
@@ -2031,6 +2110,9 @@ main() {
     test_grpc_http3_to_http3_upstream_unary
     test_grpc_http3_to_http3_upstream_streaming_and_trailers
     test_grpc_http3_to_http3_upstream_error_trailer
+    test_grpc_http3_to_http3_upstream_response_streaming
+    test_grpc_http3_upstream_connection_reuse
+    test_grpc_http3_upstream_reconnect_after_close
 
     # HTTP/3 测试
     print_header "HTTP/3 测试"
