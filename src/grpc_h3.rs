@@ -19,6 +19,10 @@ use tokio::net::lookup_host;
 use tokio::task::JoinHandle;
 
 use crate::error::{ProxyError, error};
+use crate::metrics::{
+    record_grpc_h3_pool_connection_created, record_grpc_h3_pool_connection_invalidated,
+    record_grpc_h3_pool_connection_retired, record_grpc_h3_pool_connection_reused,
+};
 
 type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 type H3RequestStream = h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
@@ -215,9 +219,11 @@ impl GrpcH3ConnectionPool {
                     if let Some(existing) = connections.get(&target.key)
                         && !existing.is_closed()
                     {
+                        record_grpc_h3_pool_connection_reused(&target.key);
                         return Ok(existing.clone());
                     }
                     connections.insert(target.key.clone(), connection.clone());
+                    record_grpc_h3_pool_connection_created(&target.key);
                     return Ok(connection);
                 }
                 Err(err) => {
@@ -240,6 +246,7 @@ impl GrpcH3ConnectionPool {
             let mut connections = self.connections.lock().await;
             match connections.get(key) {
                 Some(connection) if !connection.is_retired(Instant::now()) => {
+                    record_grpc_h3_pool_connection_reused(key);
                     return Some(connection.clone());
                 }
                 Some(_) => connections.remove(key),
@@ -250,6 +257,7 @@ impl GrpcH3ConnectionPool {
         if let Some(connection) = retired {
             // ponytail: in-use retired connections are just removed from the pool;
             // add per-stream accounting if graceful draining needs metrics.
+            record_grpc_h3_pool_connection_retired(key, connection.retirement_reason());
             if Arc::strong_count(&connection) == 1 {
                 connection.close(b"retired");
             }
@@ -273,6 +281,7 @@ impl GrpcH3ConnectionPool {
         removed
             .unwrap_or_else(|| connection.clone())
             .close(b"invalidate");
+        record_grpc_h3_pool_connection_invalidated(key);
     }
 
     async fn remove_key(&self, key: &str) {
@@ -359,6 +368,24 @@ impl GrpcH3Connection {
                 .lock()
                 .map(|last_used| should_retire_connection(self.created_at, *last_used, now))
                 .unwrap_or(true)
+    }
+
+    fn retirement_reason(&self) -> &'static str {
+        if self.is_closed() {
+            return "closed";
+        }
+
+        let Ok(last_used) = self.last_used.lock() else {
+            return "lock_error";
+        };
+        let now = Instant::now();
+        if now.duration_since(*last_used) >= GRPC_H3_POOL_IDLE_TIMEOUT {
+            "idle"
+        } else if now.duration_since(self.created_at) >= GRPC_H3_POOL_MAX_LIFETIME {
+            "max_lifetime"
+        } else {
+            "unknown"
+        }
     }
 
     fn touch(&self, now: Instant) {

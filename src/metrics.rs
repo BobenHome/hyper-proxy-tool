@@ -19,6 +19,22 @@ pub fn init_metrics() {
         "upstream_circuit_open_total",
         "Total upstream circuit breaker openings"
     );
+    describe_counter!(
+        "grpc_h3_pool_connections_created_total",
+        "Total gRPC HTTP/3 upstream pool connections created"
+    );
+    describe_counter!(
+        "grpc_h3_pool_connections_reused_total",
+        "Total gRPC HTTP/3 upstream pool connection reuses"
+    );
+    describe_counter!(
+        "grpc_h3_pool_connections_retired_total",
+        "Total gRPC HTTP/3 upstream pool connections retired"
+    );
+    describe_counter!(
+        "grpc_h3_pool_connections_invalidated_total",
+        "Total gRPC HTTP/3 upstream pool connections invalidated"
+    );
     describe_histogram!("http_request_duration_seconds", "Request latency");
     describe_histogram!("grpc_request_duration_seconds", "gRPC request latency");
     describe_gauge!("active_connections", "Active connections");
@@ -120,6 +136,39 @@ pub fn record_upstream_circuit_open(method: &str, upstream: &str, node: &str) {
         "method" => method.to_string(),
         "upstream" => upstream.to_string(),
         "node" => node.to_string()
+    )
+    .increment(1);
+}
+
+pub fn record_grpc_h3_pool_connection_created(upstream: &str) {
+    counter!(
+        "grpc_h3_pool_connections_created_total",
+        "upstream" => upstream.to_string()
+    )
+    .increment(1);
+}
+
+pub fn record_grpc_h3_pool_connection_reused(upstream: &str) {
+    counter!(
+        "grpc_h3_pool_connections_reused_total",
+        "upstream" => upstream.to_string()
+    )
+    .increment(1);
+}
+
+pub fn record_grpc_h3_pool_connection_retired(upstream: &str, reason: &str) {
+    counter!(
+        "grpc_h3_pool_connections_retired_total",
+        "upstream" => upstream.to_string(),
+        "reason" => reason.to_string()
+    )
+    .increment(1);
+}
+
+pub fn record_grpc_h3_pool_connection_invalidated(upstream: &str) {
+    counter!(
+        "grpc_h3_pool_connections_invalidated_total",
+        "upstream" => upstream.to_string()
     )
     .increment(1);
 }
