@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes};
 use futures::future;
@@ -21,6 +22,9 @@ use crate::error::{ProxyError, error};
 
 type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 type H3RequestStream = h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+
+const GRPC_H3_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const GRPC_H3_POOL_MAX_LIFETIME: Duration = Duration::from_secs(5 * 60);
 
 pub async fn send_grpc_h3_request<B>(
     upstream_base: &Uri,
@@ -174,12 +178,14 @@ async fn open_request_stream(
 ) -> Result<H3RequestStream, ProxyError> {
     let request = template.build()?;
     let mut send_request = connection.send_request.clone();
-    send_request.send_request(request).await.map_err(|err| {
+    let stream = send_request.send_request(request).await.map_err(|err| {
         error(format!(
             "Failed to send HTTP/3 upstream request headers: {}",
             err
         ))
-    })
+    })?;
+    connection.touch(Instant::now());
+    Ok(stream)
 }
 
 async fn invalidate_connection(key: &str, connection: &Arc<GrpcH3Connection>) {
@@ -230,17 +236,23 @@ impl GrpcH3ConnectionPool {
     }
 
     async fn get_active(&self, key: &str) -> Option<Arc<GrpcH3Connection>> {
-        let stale = {
+        let retired = {
             let mut connections = self.connections.lock().await;
             match connections.get(key) {
-                Some(connection) if !connection.is_closed() => return Some(connection.clone()),
+                Some(connection) if !connection.is_retired(Instant::now()) => {
+                    return Some(connection.clone());
+                }
                 Some(_) => connections.remove(key),
                 None => None,
             }
         };
 
-        if let Some(connection) = stale {
-            connection.close(b"stale");
+        if let Some(connection) = retired {
+            // ponytail: in-use retired connections are just removed from the pool;
+            // add per-stream accounting if graceful draining needs metrics.
+            if Arc::strong_count(&connection) == 1 {
+                connection.close(b"retired");
+            }
         }
         None
     }
@@ -289,6 +301,8 @@ struct GrpcH3Connection {
     quinn_conn: quinn::Connection,
     endpoint: quinn::Endpoint,
     send_request: H3SendRequest,
+    created_at: Instant,
+    last_used: Mutex<Instant>,
     driver_task: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -323,16 +337,34 @@ impl GrpcH3Connection {
             let _ = future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
 
+        let now = Instant::now();
         Ok(Self {
             quinn_conn,
             endpoint,
             send_request,
+            created_at: now,
+            last_used: Mutex::new(now),
             driver_task: Mutex::new(Some(driver_task)),
         })
     }
 
     fn is_closed(&self) -> bool {
         self.quinn_conn.close_reason().is_some()
+    }
+
+    fn is_retired(&self, now: Instant) -> bool {
+        self.is_closed()
+            || self
+                .last_used
+                .lock()
+                .map(|last_used| should_retire_connection(self.created_at, *last_used, now))
+                .unwrap_or(true)
+    }
+
+    fn touch(&self, now: Instant) {
+        if let Ok(mut last_used) = self.last_used.lock() {
+            *last_used = now;
+        }
     }
 
     fn close(&self, reason: &[u8]) {
@@ -344,6 +376,11 @@ impl GrpcH3Connection {
             driver_task.abort();
         }
     }
+}
+
+fn should_retire_connection(created_at: Instant, last_used: Instant, now: Instant) -> bool {
+    now.duration_since(last_used) >= GRPC_H3_POOL_IDLE_TIMEOUT
+        || now.duration_since(created_at) >= GRPC_H3_POOL_MAX_LIFETIME
 }
 
 impl Drop for GrpcH3Connection {
@@ -549,5 +586,30 @@ impl ServerCertVerifier for SkipServerVerification {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_retirement_policy_keeps_recent_and_retires_idle_or_old() {
+        let now = Instant::now();
+        assert!(!should_retire_connection(
+            now - Duration::from_secs(1),
+            now - Duration::from_secs(1),
+            now
+        ));
+        assert!(should_retire_connection(
+            now - Duration::from_secs(1),
+            now - GRPC_H3_POOL_IDLE_TIMEOUT - Duration::from_secs(1),
+            now
+        ));
+        assert!(should_retire_connection(
+            now - GRPC_H3_POOL_MAX_LIFETIME - Duration::from_secs(1),
+            now,
+            now
+        ));
     }
 }
