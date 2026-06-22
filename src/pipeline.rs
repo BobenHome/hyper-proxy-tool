@@ -9,6 +9,7 @@ use hyper::{HeaderMap, Method, StatusCode, Uri};
 use crate::auth::{self, Claims};
 use crate::config::{
     AppConfig, GrpcRetryMode, GrpcRouteConfig, ResilienceConfig, RouteConfig, UpstreamProtocol,
+    UpstreamTlsConfig,
 };
 use crate::grpc;
 use crate::plugin::{WasmInput, WasmOutput};
@@ -97,6 +98,7 @@ pub struct ForwardPlan {
     pub claims: Option<Claims>,
     pub target_upstream_name: String,
     pub upstream_protocol: UpstreamProtocol,
+    pub upstream_tls: UpstreamTlsConfig,
     pub upstream_state: Arc<UpstreamState>,
     pub active_urls: Vec<String>,
     pub original_path: String,
@@ -193,7 +195,7 @@ pub fn evaluate_request(
         crate::canary::select_target_upstream(ctx.headers, &route);
     let target_upstream_name = target_upstream_name.to_string();
 
-    let (upstream_state, active_urls, upstream_protocol) =
+    let (upstream_state, active_urls, upstream_protocol, upstream_tls) =
         match resolve_upstream(&target_upstream_name, &app_config, state, response_kind) {
             Ok(v) => v,
             Err(reject) => return PipelineDecision::Reject(reject),
@@ -251,6 +253,7 @@ pub fn evaluate_request(
         claims,
         target_upstream_name,
         upstream_protocol,
+        upstream_tls,
         upstream_state,
         active_urls,
         original_path: path.to_string(),
@@ -438,7 +441,15 @@ fn resolve_upstream(
     app_config: &AppConfig,
     state: &AppState,
     response_kind: RejectResponseKind,
-) -> Result<(Arc<UpstreamState>, Vec<String>, UpstreamProtocol), PipelineReject> {
+) -> Result<
+    (
+        Arc<UpstreamState>,
+        Vec<String>,
+        UpstreamProtocol,
+        UpstreamTlsConfig,
+    ),
+    PipelineReject,
+> {
     let Some(upstream_config) = app_config.upstreams.get(target_upstream_name) else {
         return Err(make_reject(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -474,7 +485,12 @@ fn resolve_upstream(
         ));
     }
 
-    Ok((upstream_state, active_urls, upstream_config.protocol))
+    Ok((
+        upstream_state,
+        active_urls,
+        upstream_config.protocol,
+        upstream_config.tls.clone(),
+    ))
 }
 
 fn make_reject(
@@ -593,6 +609,7 @@ mod tests {
             UpstreamConfig {
                 urls: vec!["http://127.0.0.1:50051".to_string()],
                 protocol: UpstreamProtocol::Auto,
+                tls: UpstreamTlsConfig::default(),
                 health_check: false,
                 health: None,
             },
@@ -602,6 +619,7 @@ mod tests {
             UpstreamConfig {
                 urls: vec!["https://127.0.0.1:50054".to_string()],
                 protocol: UpstreamProtocol::GrpcH3,
+                tls: UpstreamTlsConfig::default(),
                 health_check: false,
                 health: None,
             },

@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::config::{AppConfig, HealthCheckMode, UpstreamHealthConfig, UpstreamProtocol};
+use crate::config::{
+    AppConfig, HealthCheckMode, UpstreamHealthConfig, UpstreamProtocol, UpstreamTlsConfig,
+};
 use crate::error::{ProxyError, error};
 use crate::grpc::{self, GrpcCode, HealthServingStatus};
 use crate::state::{AppState, HttpClient};
@@ -83,6 +85,7 @@ pub async fn start_health_check_loop(
                             url,
                             &health_config,
                             upstream_config.protocol,
+                            &upstream_config.tls,
                         )
                         .await
                         {
@@ -149,13 +152,14 @@ async fn check_upstream_with_mode(
     url: &str,
     health_config: &UpstreamHealthConfig,
     upstream_protocol: UpstreamProtocol,
+    upstream_tls: &UpstreamTlsConfig,
 ) -> bool {
     match health_config.mode {
         HealthCheckMode::Http => {
             check_upstream_http(client, url, health_timeout(health_config)).await
         }
         HealthCheckMode::Grpc if upstream_protocol == UpstreamProtocol::GrpcH3 => {
-            check_upstream_grpc_h3(url, health_config).await
+            check_upstream_grpc_h3(url, health_config, upstream_tls).await
         }
         HealthCheckMode::Grpc => check_upstream_grpc(grpc_client, url, health_config).await,
         HealthCheckMode::Off => true,
@@ -203,10 +207,14 @@ pub async fn check_upstream_grpc(
 }
 
 /// Check if an HTTP/3 upstream is healthy via grpc.health.v1.Health/Check.
-pub async fn check_upstream_grpc_h3(url: &str, health_config: &UpstreamHealthConfig) -> bool {
+pub async fn check_upstream_grpc_h3(
+    url: &str,
+    health_config: &UpstreamHealthConfig,
+    upstream_tls: &UpstreamTlsConfig,
+) -> bool {
     match tokio::time::timeout(
         health_timeout(health_config),
-        check_upstream_grpc_h3_inner(url, health_config),
+        check_upstream_grpc_h3_inner(url, health_config, upstream_tls),
     )
     .await
     {
@@ -225,6 +233,7 @@ pub async fn check_upstream_grpc_h3(url: &str, health_config: &UpstreamHealthCon
 async fn check_upstream_grpc_h3_inner(
     url: &str,
     health_config: &UpstreamHealthConfig,
+    upstream_tls: &UpstreamTlsConfig,
 ) -> Result<bool, ProxyError> {
     let uri: Uri = format!("{}/grpc.health.v1.Health/Check", url.trim_end_matches('/'))
         .parse()
@@ -244,7 +253,7 @@ async fn check_upstream_grpc_h3_inner(
         )))
         .unwrap();
 
-    let res = crate::grpc_h3::send_grpc_h3_request(&upstream_base, req).await?;
+    let res = crate::grpc_h3::send_grpc_h3_request(&upstream_base, upstream_tls, req).await?;
     if res.status() != StatusCode::OK {
         return Ok(false);
     }

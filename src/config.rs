@@ -47,6 +47,8 @@ pub struct UpstreamConfig {
     pub urls: Vec<String>,
     #[serde(default)]
     pub protocol: UpstreamProtocol,
+    #[serde(default)]
+    pub tls: UpstreamTlsConfig,
     #[serde(default = "default_health_check")]
     pub health_check: bool,
     #[serde(default)]
@@ -63,6 +65,14 @@ pub enum UpstreamProtocol {
     #[default]
     Auto,
     GrpcH3,
+}
+
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct UpstreamTlsConfig {
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
+    pub server_name: Option<String>,
+    pub ca_cert: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]

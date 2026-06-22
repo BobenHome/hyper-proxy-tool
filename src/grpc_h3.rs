@@ -14,10 +14,11 @@ use hyper::{HeaderMap, Method, Request, Response, Uri, Version};
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, SignatureScheme};
+use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
 use tokio::net::lookup_host;
 use tokio::task::JoinHandle;
 
+use crate::config::UpstreamTlsConfig;
 use crate::error::{ProxyError, error};
 use crate::metrics::{
     record_grpc_h3_pool_connection_created, record_grpc_h3_pool_connection_invalidated,
@@ -32,13 +33,14 @@ const GRPC_H3_POOL_MAX_LIFETIME: Duration = Duration::from_secs(5 * 60);
 
 pub async fn send_grpc_h3_request<B>(
     upstream_base: &Uri,
+    tls: &UpstreamTlsConfig,
     req: Request<B>,
 ) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError>
 where
     B: HyperBody<Data = Bytes> + Send + Unpin + 'static,
     B::Error: Into<ProxyError>,
 {
-    let target = GrpcH3Target::from_uri(upstream_base)?;
+    let target = GrpcH3Target::from_uri(upstream_base, tls)?;
     let (parts, mut body) = req.into_parts();
     let template = H3RequestTemplate::from_parts(parts);
     let (connection, mut request_stream) =
@@ -119,8 +121,8 @@ async fn resolve_upstream_addr(host: &str, port: u16) -> Result<SocketAddr, Prox
     })
 }
 
-fn build_client_config() -> Result<quinn::ClientConfig, ProxyError> {
-    let mut crypto = rustls::ClientConfig::builder_with_provider(Arc::new(
+fn build_client_config(tls: &UpstreamTlsConfig) -> Result<quinn::ClientConfig, ProxyError> {
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::aws_lc_rs::default_provider(),
     ))
     .with_protocol_versions(&[&rustls::version::TLS13])
@@ -129,10 +131,18 @@ fn build_client_config() -> Result<quinn::ClientConfig, ProxyError> {
             "Failed to set HTTP/3 upstream TLS versions: {}",
             err
         ))
-    })?
-    .dangerous()
-    .with_custom_certificate_verifier(SkipServerVerification::new())
-    .with_no_client_auth();
+    })?;
+
+    let mut crypto = if tls.insecure_skip_verify {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(SkipServerVerification::new())
+            .with_no_client_auth()
+    } else {
+        builder
+            .with_root_certificates(load_root_certs(tls)?)
+            .with_no_client_auth()
+    };
     crypto.alpn_protocols = vec![b"h3".to_vec()];
     Ok(quinn::ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(crypto).map_err(|err| {
@@ -142,6 +152,37 @@ fn build_client_config() -> Result<quinn::ClientConfig, ProxyError> {
             ))
         })?,
     )))
+}
+
+fn load_root_certs(tls: &UpstreamTlsConfig) -> Result<RootCertStore, ProxyError> {
+    let mut roots = RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    for cert in native.certs {
+        roots.add(cert).map_err(|err| {
+            error(format!(
+                "Failed to add native HTTP/3 upstream root certificate: {}",
+                err
+            ))
+        })?;
+    }
+
+    if let Some(ca_cert) = tls.ca_cert.as_deref() {
+        for cert in crate::tls::load_certs(ca_cert)? {
+            roots.add(cert).map_err(|err| {
+                error(format!(
+                    "Failed to add HTTP/3 upstream CA certificate '{}': {}",
+                    ca_cert, err
+                ))
+            })?;
+        }
+    }
+
+    if roots.is_empty() {
+        return Err(error(
+            "No root certificates available for HTTP/3 upstream TLS".to_string(),
+        ));
+    }
+    Ok(roots)
 }
 
 static GRPC_H3_POOL: OnceLock<GrpcH3ConnectionPool> = OnceLock::new();
@@ -330,10 +371,11 @@ impl GrpcH3Connection {
                 err
             ))
         })?;
-        endpoint.set_default_client_config(build_client_config()?);
+        endpoint.set_default_client_config(build_client_config(&target.tls)?);
 
+        let server_name = target.server_name.as_deref().unwrap_or(&target.host);
         let quinn_conn = endpoint
-            .connect(server_addr, &target.host)
+            .connect(server_addr, server_name)
             .map_err(|err| error(format!("Failed to start HTTP/3 upstream connect: {}", err)))?
             .await
             .map_err(|err| error(format!("Failed to connect HTTP/3 upstream: {}", err)))?;
@@ -421,10 +463,12 @@ struct GrpcH3Target {
     key: String,
     host: String,
     port: u16,
+    server_name: Option<String>,
+    tls: UpstreamTlsConfig,
 }
 
 impl GrpcH3Target {
-    fn from_uri(uri: &Uri) -> Result<Self, ProxyError> {
+    fn from_uri(uri: &Uri, tls: &UpstreamTlsConfig) -> Result<Self, ProxyError> {
         let scheme = uri.scheme_str().unwrap_or("https");
         if scheme != "https" {
             return Err(error(format!(
@@ -438,10 +482,28 @@ impl GrpcH3Target {
             .ok_or_else(|| error(format!("HTTP/3 upstream missing host: {}", uri)))?
             .to_string();
         let port = uri.port_u16().unwrap_or(443);
-        let key = format!("{}://{}:{}", scheme, host, port);
+        let key = grpc_h3_pool_key(scheme, &host, port, tls);
 
-        Ok(Self { key, host, port })
+        Ok(Self {
+            key,
+            host,
+            port,
+            server_name: tls.server_name.clone(),
+            tls: tls.clone(),
+        })
     }
+}
+
+fn grpc_h3_pool_key(scheme: &str, host: &str, port: u16, tls: &UpstreamTlsConfig) -> String {
+    format!(
+        "{}://{}:{}|tls:skip={}:sni={}:ca={}",
+        scheme,
+        host,
+        port,
+        tls.insecure_skip_verify,
+        tls.server_name.as_deref().unwrap_or(""),
+        tls.ca_cert.as_deref().unwrap_or("")
+    )
 }
 
 struct H3RequestTemplate {
@@ -638,5 +700,22 @@ mod tests {
             now,
             now
         ));
+    }
+
+    #[test]
+    fn target_uses_tls_config_for_pool_key_and_server_name() {
+        let tls = UpstreamTlsConfig {
+            insecure_skip_verify: false,
+            server_name: Some("grpc.internal".to_string()),
+            ca_cert: Some("ca.pem".to_string()),
+        };
+        let uri = "https://127.0.0.1:50054".parse::<Uri>().unwrap();
+        let target = GrpcH3Target::from_uri(&uri, &tls).unwrap();
+
+        assert_eq!(target.server_name.as_deref(), Some("grpc.internal"));
+        assert_eq!(
+            target.key,
+            "https://127.0.0.1:50054|tls:skip=false:sni=grpc.internal:ca=ca.pem"
+        );
     }
 }

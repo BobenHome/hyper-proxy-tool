@@ -18,6 +18,7 @@ tower-http = { version = "0.6", features = ["trace"] }
 
 # 1. 纯 Rust 的 TLS 实现，安全且现代
 rustls = "0.23"
+rustls-native-certs = "0.8"
 # 2. 为 Hyper Client 提供 HTTPS 支持
 hyper-rustls = { version = "0.27", features = ["http1", "http2", "tls12", "native-tokio"] }
 # 3. 为 Tokio 提供 TLS 监听支持

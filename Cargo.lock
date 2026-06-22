@@ -1735,6 +1735,7 @@ dependencies = [
  "rand 0.10.0",
  "rustls",
  "rustls-acme",
+ "rustls-native-certs",
  "rustls-pemfile",
  "rustls-pki-types",
  "serde",

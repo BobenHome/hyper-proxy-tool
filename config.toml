@@ -51,6 +51,8 @@ endpoint = "http://localhost:4317"
   [upstreams.grpc_h3_backend]
   urls = ["https://127.0.0.1:50054"]
   protocol = "grpc_h3"
+    [upstreams.grpc_h3_backend.tls]
+    insecure_skip_verify = true
     [upstreams.grpc_h3_backend.health]
     mode = "grpc"
     interval_ms = 500

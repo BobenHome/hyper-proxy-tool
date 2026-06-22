@@ -1666,7 +1666,8 @@ where
         }
     };
 
-    let request_fut = crate::grpc_h3::send_grpc_h3_request(&upstream_base, upstream_req);
+    let request_fut =
+        crate::grpc_h3::send_grpc_h3_request(&upstream_base, &plan.upstream_tls, upstream_req);
     let timeout = grpc::effective_grpc_timeout(
         plan.resilience.timeout_duration(),
         plan.grpc_timeout,
