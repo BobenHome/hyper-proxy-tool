@@ -35,6 +35,10 @@ pub fn init_metrics() {
         "grpc_h3_pool_connections_invalidated_total",
         "Total gRPC HTTP/3 upstream pool connections invalidated"
     );
+    describe_counter!(
+        "grpc_h3_upstream_tls_errors_total",
+        "Total gRPC HTTP/3 upstream TLS/QUIC connection errors"
+    );
     describe_histogram!("http_request_duration_seconds", "Request latency");
     describe_histogram!("grpc_request_duration_seconds", "gRPC request latency");
     describe_gauge!("active_connections", "Active connections");
@@ -169,6 +173,16 @@ pub fn record_grpc_h3_pool_connection_invalidated(upstream: &str) {
     counter!(
         "grpc_h3_pool_connections_invalidated_total",
         "upstream" => upstream.to_string()
+    )
+    .increment(1);
+}
+
+pub fn record_grpc_h3_upstream_tls_error(upstream: &str, stage: &str, reason: &str) {
+    counter!(
+        "grpc_h3_upstream_tls_errors_total",
+        "upstream" => upstream.to_string(),
+        "stage" => stage.to_string(),
+        "reason" => reason.to_string()
     )
     .increment(1);
 }

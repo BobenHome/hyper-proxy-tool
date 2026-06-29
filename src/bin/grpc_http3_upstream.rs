@@ -3,11 +3,14 @@ use h3::server;
 use h3_quinn::Connection as H3QuinnConnection;
 use hyper::{Request, Response, StatusCode};
 use quinn::Endpoint;
+use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::WebPkiClientVerifier;
 use std::env;
 use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -201,9 +204,17 @@ async fn handle_request(
 fn build_server_config() -> Result<quinn::ServerConfig, AnyError> {
     let certs = load_certs("cert.pem")?;
     let key = load_private_key("key.pem")?;
-    let mut rustls_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
+    let builder = rustls::ServerConfig::builder();
+    let builder = if env::var("GRPC_H3_REQUIRE_CLIENT_CERT").as_deref() == Ok("1") {
+        let mut roots = RootCertStore::empty();
+        for cert in load_certs("cert.pem")? {
+            roots.add(cert)?;
+        }
+        builder.with_client_cert_verifier(WebPkiClientVerifier::builder(Arc::new(roots)).build()?)
+    } else {
+        builder.with_no_client_auth()
+    };
+    let mut rustls_config = builder.with_single_cert(certs, key)?;
     rustls_config.alpn_protocols = vec![b"h3".to_vec()];
     let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)?;
     Ok(quinn::ServerConfig::with_crypto(std::sync::Arc::new(

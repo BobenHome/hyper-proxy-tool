@@ -58,6 +58,15 @@ endpoint = "http://localhost:4317"
     interval_ms = 500
     timeout_ms = 1000
 
+  [upstreams.grpc_h3_mtls_backend]
+  urls = ["https://127.0.0.1:50055"]
+  protocol = "grpc_h3"
+  health_check = false
+    [upstreams.grpc_h3_mtls_backend.tls]
+    insecure_skip_verify = true
+    client_cert = "client-cert.pem"
+    client_key = "client-key.pem"
+
   [upstreams.grpc_retry_connect_backend]
   urls = ["http://127.0.0.1:50053", "http://127.0.0.1:50051"]
   health_check = false
@@ -142,6 +151,12 @@ grpc = true
 [[routes]]
 path = "/h3.Greeter"
 upstream = "grpc_h3_backend"
+strip_prefix = false
+grpc = true
+
+[[routes]]
+path = "/h3mtls.Greeter"
+upstream = "grpc_h3_mtls_backend"
 strip_prefix = false
 grpc = true
 

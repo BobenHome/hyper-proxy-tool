@@ -73,6 +73,8 @@ pub struct UpstreamTlsConfig {
     pub insecure_skip_verify: bool,
     pub server_name: Option<String>,
     pub ca_cert: Option<String>,
+    pub client_cert: Option<String>,
+    pub client_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]

@@ -21,6 +21,7 @@ WT_UPSTREAM_PID=""
 GRPC_UPSTREAM_PIDS=""
 GRPC_HTTP3_CLIENT_READY=0
 GRPC_HTTP3_UPSTREAM_READY=0
+GRPC_H3_MTLS_READY=0
 
 # 测试计数器
 TESTS_PASSED=0
@@ -74,6 +75,41 @@ set_grpc_health_status() {
     local name="$1"
     local status="$2"
     printf '%s\n' "$status" > "$(grpc_health_file "$name")"
+}
+
+prepare_grpc_h3_mtls_client_cert() {
+    if [ "$GRPC_H3_MTLS_READY" -eq 1 ]; then
+        return 0
+    fi
+
+    if ! command -v openssl &> /dev/null; then
+        return 1
+    fi
+
+    (
+        cd "$SCRIPT_DIR"
+        cat > /tmp/hyper-proxy-tool-client-cert.cnf <<'EOF'
+[req]
+distinguished_name = dn
+prompt = no
+[dn]
+CN = hyper-proxy-tool-test-client
+EOF
+        openssl req -newkey rsa:2048 -nodes \
+            -keyout client-key.pem \
+            -out /tmp/hyper-proxy-tool-client.csr \
+            -config /tmp/hyper-proxy-tool-client-cert.cnf >/tmp/hyper-proxy-tool-client-cert.log 2>&1
+        openssl x509 -req \
+            -in /tmp/hyper-proxy-tool-client.csr \
+            -CA cert.pem \
+            -CAkey key.pem \
+            -CAcreateserial \
+            -days 1 \
+            -out client-cert.pem >/tmp/hyper-proxy-tool-client-cert.log 2>&1
+    ) || return 1
+
+    GRPC_H3_MTLS_READY=1
+    return 0
 }
 
 is_local_http_upstream_ready() {
@@ -275,22 +311,30 @@ start_grpc_http3_upstream() {
         return
     fi
 
-    print_test "启动本地 gRPC HTTP/3 测试上游 (127.0.0.1:50054/UDP)"
+    if ! prepare_grpc_h3_mtls_client_cert; then
+        print_skip "openssl 不可用或生成 mTLS client cert 失败，跳过本地 gRPC HTTP/3 测试上游"
+        cat /tmp/hyper-proxy-tool-client-cert.log 2>/dev/null || true
+        return
+    fi
+
+    print_test "启动本地 gRPC HTTP/3 测试上游 (127.0.0.1:50054/50055 UDP)"
 
     if command -v lsof &> /dev/null; then
-        local existing_pids
-        existing_pids="$(lsof -t -nP -iUDP:50054 2>/dev/null || true)"
-        if [ -n "$existing_pids" ]; then
-            print_test "清理已占用 UDP 50054 的旧 gRPC HTTP/3 测试上游进程: $existing_pids"
-            for pid in $existing_pids; do
-                {
-                    kill "$pid" || true
-                    sleep 0.2
-                    kill -9 "$pid" || true
-                    wait "$pid" || true
-                } 2>/dev/null
-            done
-        fi
+        for port in 50054 50055; do
+            local existing_pids
+            existing_pids="$(lsof -t -nP -iUDP:$port 2>/dev/null || true)"
+            if [ -n "$existing_pids" ]; then
+                print_test "清理已占用 UDP $port 的旧 gRPC HTTP/3 测试上游进程: $existing_pids"
+                for pid in $existing_pids; do
+                    {
+                        kill "$pid" || true
+                        sleep 0.2
+                        kill -9 "$pid" || true
+                        wait "$pid" || true
+                    } 2>/dev/null
+                done
+            fi
+        done
     fi
 
     if [ "$GRPC_HTTP3_UPSTREAM_READY" -ne 1 ]; then
@@ -307,16 +351,22 @@ start_grpc_http3_upstream() {
         GRPC_H3_PORT="50054" GRPC_H3_NAME="grpc-h3" "$SCRIPT_DIR/target/debug/grpc_http3_upstream"
     ) > /tmp/hyper-proxy-tool-grpc-h3.log 2>&1 &
     local pid=$!
+    (
+        cd "$SCRIPT_DIR"
+        GRPC_H3_PORT="50055" GRPC_H3_NAME="grpc-h3-mtls" GRPC_H3_REQUIRE_CLIENT_CERT="1" "$SCRIPT_DIR/target/debug/grpc_http3_upstream"
+    ) > /tmp/hyper-proxy-tool-grpc-h3-mtls.log 2>&1 &
+    local mtls_pid=$!
 
     sleep 0.8
-    if kill -0 "$pid" 2>/dev/null; then
-        GRPC_UPSTREAM_PIDS="$GRPC_UPSTREAM_PIDS $pid"
+    if kill -0 "$pid" 2>/dev/null && kill -0 "$mtls_pid" 2>/dev/null; then
+        GRPC_UPSTREAM_PIDS="$GRPC_UPSTREAM_PIDS $pid $mtls_pid"
         print_pass "本地 gRPC HTTP/3 测试上游启动成功"
         return
     fi
 
     print_fail "本地 gRPC HTTP/3 测试上游启动失败"
     cat /tmp/hyper-proxy-tool-grpc-h3.log 2>/dev/null || true
+    cat /tmp/hyper-proxy-tool-grpc-h3-mtls.log 2>/dev/null || true
 }
 
 stop_grpc_upstreams() {
@@ -333,6 +383,9 @@ stop_grpc_upstreams() {
     done
     GRPC_UPSTREAM_PIDS=""
     rm -f "$(grpc_health_file grpc-a)" "$(grpc_health_file grpc-b)"
+    rm -f "$SCRIPT_DIR/client-cert.pem" "$SCRIPT_DIR/client-key.pem"
+    rm -f /tmp/hyper-proxy-tool-client.csr /tmp/hyper-proxy-tool-client-cert.cnf /tmp/hyper-proxy-tool-client-cert.log
+    rm -f "$SCRIPT_DIR/cert.srl"
 }
 
 start_wt_upstream() {
@@ -1450,6 +1503,30 @@ test_grpc_http3_to_http3_upstream_unary() {
     fi
 }
 
+test_grpc_http3_to_http3_upstream_mtls() {
+    print_test "测试 gRPC HTTP/3 mTLS 上游转发"
+
+    if ! is_local_server_url; then
+        print_skip "gRPC over HTTP/3 本地集成测试仅针对本地代理运行"
+        return
+    fi
+
+    if ! command -v cargo &> /dev/null; then
+        print_skip "需要 cargo 来运行 gRPC over HTTP/3 集成测试"
+        return
+    fi
+
+    local response
+    response=$(grpc_http3_proxy_request "/h3mtls.Greeter/SayHello" 2>/tmp/hyper-proxy-tool-grpc-h3-upstream-mtls.log || true)
+
+    if echo "$response" | grep -q "grpc-h3-mtls"; then
+        print_pass "HTTP/3 入站 gRPC 请求已通过 mTLS 转发到 HTTP/3 上游"
+    else
+        print_fail "HTTP/3 mTLS upstream 响应不符合预期，响应: $response"
+        cat /tmp/hyper-proxy-tool-grpc-h3-upstream-mtls.log 2>/dev/null || true
+    fi
+}
+
 test_grpc_http3_to_http3_upstream_streaming_and_trailers() {
     print_test "测试 gRPC HTTP/3 上游多 DATA frame 与 request trailer 透传"
 
@@ -2108,6 +2185,7 @@ main() {
     test_grpc_http3_request_trailer_passthrough
     test_grpc_http3_large_streaming_request
     test_grpc_http3_to_http3_upstream_unary
+    test_grpc_http3_to_http3_upstream_mtls
     test_grpc_http3_to_http3_upstream_streaming_and_trailers
     test_grpc_http3_to_http3_upstream_error_trailer
     test_grpc_http3_to_http3_upstream_response_streaming

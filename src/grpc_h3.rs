@@ -23,6 +23,7 @@ use crate::error::{ProxyError, error};
 use crate::metrics::{
     record_grpc_h3_pool_connection_created, record_grpc_h3_pool_connection_invalidated,
     record_grpc_h3_pool_connection_retired, record_grpc_h3_pool_connection_reused,
+    record_grpc_h3_upstream_tls_error,
 };
 
 type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
@@ -134,14 +135,41 @@ fn build_client_config(tls: &UpstreamTlsConfig) -> Result<quinn::ClientConfig, P
     })?;
 
     let mut crypto = if tls.insecure_skip_verify {
-        builder
+        let builder = builder
             .dangerous()
-            .with_custom_certificate_verifier(SkipServerVerification::new())
-            .with_no_client_auth()
+            .with_custom_certificate_verifier(SkipServerVerification::new());
+        match (tls.client_cert.as_deref(), tls.client_key.as_deref()) {
+            (None, None) => builder.with_no_client_auth(),
+            (Some(cert), Some(key)) => builder
+                .with_client_auth_cert(
+                    crate::tls::load_certs(cert)?,
+                    crate::tls::load_private_key(key)?,
+                )
+                .map_err(|err| {
+                    error(format!(
+                        "Failed to set HTTP/3 upstream client certificate '{}': {}",
+                        cert, err
+                    ))
+                })?,
+            _ => return Err(missing_mtls_pair_error()),
+        }
     } else {
-        builder
-            .with_root_certificates(load_root_certs(tls)?)
-            .with_no_client_auth()
+        let builder = builder.with_root_certificates(load_root_certs(tls)?);
+        match (tls.client_cert.as_deref(), tls.client_key.as_deref()) {
+            (None, None) => builder.with_no_client_auth(),
+            (Some(cert), Some(key)) => builder
+                .with_client_auth_cert(
+                    crate::tls::load_certs(cert)?,
+                    crate::tls::load_private_key(key)?,
+                )
+                .map_err(|err| {
+                    error(format!(
+                        "Failed to set HTTP/3 upstream client certificate '{}': {}",
+                        cert, err
+                    ))
+                })?,
+            _ => return Err(missing_mtls_pair_error()),
+        }
     };
     crypto.alpn_protocols = vec![b"h3".to_vec()];
     Ok(quinn::ClientConfig::new(Arc::new(
@@ -152,6 +180,10 @@ fn build_client_config(tls: &UpstreamTlsConfig) -> Result<quinn::ClientConfig, P
             ))
         })?,
     )))
+}
+
+fn missing_mtls_pair_error() -> ProxyError {
+    error("HTTP/3 upstream mTLS requires both client_cert and client_key".to_string())
 }
 
 fn load_root_certs(tls: &UpstreamTlsConfig) -> Result<RootCertStore, ProxyError> {
@@ -183,6 +215,10 @@ fn load_root_certs(tls: &UpstreamTlsConfig) -> Result<RootCertStore, ProxyError>
         ));
     }
     Ok(roots)
+}
+
+fn record_tls_error(upstream: &str, stage: &'static str, reason: &'static str) {
+    record_grpc_h3_upstream_tls_error(upstream, stage, reason);
 }
 
 static GRPC_H3_POOL: OnceLock<GrpcH3ConnectionPool> = OnceLock::new();
@@ -366,23 +402,46 @@ impl GrpcH3Connection {
         };
 
         let mut endpoint = quinn::Endpoint::client(SocketAddr::new(bind_ip, 0)).map_err(|err| {
+            record_tls_error(&target.metrics_label, "endpoint", "endpoint_create_failed");
             error(format!(
                 "Failed to create HTTP/3 upstream endpoint: {}",
                 err
             ))
         })?;
-        endpoint.set_default_client_config(build_client_config(&target.tls)?);
+        let client_config = build_client_config(&target.tls).inspect_err(|err| {
+            record_tls_error(
+                &target.metrics_label,
+                "config",
+                tls_config_error_reason(err),
+            );
+        })?;
+        endpoint.set_default_client_config(client_config);
 
         let server_name = target.server_name.as_deref().unwrap_or(&target.host);
         let quinn_conn = endpoint
             .connect(server_addr, server_name)
-            .map_err(|err| error(format!("Failed to start HTTP/3 upstream connect: {}", err)))?
+            .map_err(|err| {
+                record_tls_error(
+                    &target.metrics_label,
+                    "connect_start",
+                    "connect_start_failed",
+                );
+                error(format!("Failed to start HTTP/3 upstream connect: {}", err))
+            })?
             .await
-            .map_err(|err| error(format!("Failed to connect HTTP/3 upstream: {}", err)))?;
+            .map_err(|err| {
+                record_tls_error(
+                    &target.metrics_label,
+                    "handshake",
+                    quic_connect_error_reason(&err),
+                );
+                error(format!("Failed to connect HTTP/3 upstream: {}", err))
+            })?;
         let h3_conn = h3_quinn::Connection::new(quinn_conn.clone());
-        let (mut driver, send_request) = client::new(h3_conn)
-            .await
-            .map_err(|err| error(format!("Failed to create HTTP/3 upstream client: {}", err)))?;
+        let (mut driver, send_request) = client::new(h3_conn).await.map_err(|err| {
+            record_tls_error(&target.metrics_label, "h3_client", "h3_client_init_failed");
+            error(format!("Failed to create HTTP/3 upstream client: {}", err))
+        })?;
 
         let driver_task = tokio::spawn(async move {
             let _ = future::poll_fn(|cx| driver.poll_close(cx)).await;
@@ -461,6 +520,7 @@ impl Drop for GrpcH3Connection {
 #[derive(Clone)]
 struct GrpcH3Target {
     key: String,
+    metrics_label: String,
     host: String,
     port: u16,
     server_name: Option<String>,
@@ -483,9 +543,11 @@ impl GrpcH3Target {
             .to_string();
         let port = uri.port_u16().unwrap_or(443);
         let key = grpc_h3_pool_key(scheme, &host, port, tls);
+        let metrics_label = format!("{}://{}:{}", scheme, host, port);
 
         Ok(Self {
             key,
+            metrics_label,
             host,
             port,
             server_name: tls.server_name.clone(),
@@ -494,15 +556,49 @@ impl GrpcH3Target {
     }
 }
 
+fn tls_config_error_reason(err: &ProxyError) -> &'static str {
+    let msg = err.to_string();
+    if msg.contains("client_cert and client_key") {
+        "mtls_pair_missing"
+    } else if msg.contains("client certificate") {
+        "client_cert_invalid"
+    } else if msg.contains("cert file") || msg.contains("load certs") {
+        "cert_load_failed"
+    } else if msg.contains("key file") || msg.contains("private key") {
+        "client_key_invalid"
+    } else if msg.contains("root certificate") {
+        "root_cert_invalid"
+    } else if msg.contains("QUIC config") {
+        "quic_config_failed"
+    } else {
+        "config_failed"
+    }
+}
+
+fn quic_connect_error_reason(err: &quinn::ConnectionError) -> &'static str {
+    match err {
+        quinn::ConnectionError::TimedOut => "connect_timeout",
+        quinn::ConnectionError::LocallyClosed => "locally_closed",
+        quinn::ConnectionError::ConnectionClosed(_) => "connection_closed",
+        quinn::ConnectionError::ApplicationClosed(_) => "application_closed",
+        quinn::ConnectionError::Reset => "reset",
+        quinn::ConnectionError::TransportError(_) => "transport_error",
+        quinn::ConnectionError::VersionMismatch => "version_mismatch",
+        quinn::ConnectionError::CidsExhausted => "cids_exhausted",
+    }
+}
+
 fn grpc_h3_pool_key(scheme: &str, host: &str, port: u16, tls: &UpstreamTlsConfig) -> String {
     format!(
-        "{}://{}:{}|tls:skip={}:sni={}:ca={}",
+        "{}://{}:{}|tls:skip={}:sni={}:ca={}:client_cert={}:client_key={}",
         scheme,
         host,
         port,
         tls.insecure_skip_verify,
         tls.server_name.as_deref().unwrap_or(""),
-        tls.ca_cert.as_deref().unwrap_or("")
+        tls.ca_cert.as_deref().unwrap_or(""),
+        tls.client_cert.as_deref().unwrap_or(""),
+        tls.client_key.as_deref().unwrap_or("")
     )
 }
 
@@ -708,6 +804,8 @@ mod tests {
             insecure_skip_verify: false,
             server_name: Some("grpc.internal".to_string()),
             ca_cert: Some("ca.pem".to_string()),
+            client_cert: Some("client.pem".to_string()),
+            client_key: Some("client-key.pem".to_string()),
         };
         let uri = "https://127.0.0.1:50054".parse::<Uri>().unwrap();
         let target = GrpcH3Target::from_uri(&uri, &tls).unwrap();
@@ -715,7 +813,49 @@ mod tests {
         assert_eq!(target.server_name.as_deref(), Some("grpc.internal"));
         assert_eq!(
             target.key,
-            "https://127.0.0.1:50054|tls:skip=false:sni=grpc.internal:ca=ca.pem"
+            "https://127.0.0.1:50054|tls:skip=false:sni=grpc.internal:ca=ca.pem:client_cert=client.pem:client_key=client-key.pem"
         );
+    }
+
+    #[test]
+    fn mtls_requires_cert_and_key_together() {
+        let tls = UpstreamTlsConfig {
+            insecure_skip_verify: true,
+            server_name: None,
+            ca_cert: None,
+            client_cert: Some("client.pem".to_string()),
+            client_key: None,
+        };
+
+        let err = build_client_config(&tls).unwrap_err();
+        assert!(err.to_string().contains("client_cert and client_key"));
+        assert_eq!(tls_config_error_reason(&err), "mtls_pair_missing");
+    }
+
+    #[test]
+    fn mtls_accepts_client_cert_and_key() {
+        let tls = UpstreamTlsConfig {
+            insecure_skip_verify: true,
+            server_name: None,
+            ca_cert: None,
+            client_cert: Some("cert.pem".to_string()),
+            client_key: Some("key.pem".to_string()),
+        };
+
+        build_client_config(&tls).unwrap();
+    }
+
+    #[test]
+    fn classifies_missing_client_key_file_as_client_key_invalid() {
+        let tls = UpstreamTlsConfig {
+            insecure_skip_verify: true,
+            server_name: None,
+            ca_cert: None,
+            client_cert: Some("cert.pem".to_string()),
+            client_key: Some("missing-key.pem".to_string()),
+        };
+
+        let err = build_client_config(&tls).unwrap_err();
+        assert_eq!(tls_config_error_reason(&err), "client_key_invalid");
     }
 }
